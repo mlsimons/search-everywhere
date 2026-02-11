@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { CommandSearchItem, SearchItemType, SearchProvider } from '../core/types';
+import Logger from '../utils/logging';
 
 /**
  * Provides VSCode commands for searching
@@ -8,7 +9,7 @@ export class CommandSearchProvider implements SearchProvider {
     /**
      * Get all indexed command items
      */
-    public async getItems(): Promise<CommandSearchItem[]> {
+    public async getItems(_onBatch?: import('../core/types').OnBatchCallback): Promise<CommandSearchItem[]> {
         // For commands, we always refresh to ensure we have the latest
         return this.getCommandItems();
     }
@@ -16,7 +17,7 @@ export class CommandSearchProvider implements SearchProvider {
     /**
      * Refresh the command index
      */
-    public async refresh(): Promise<void> {
+    public async refresh(_force?: boolean): Promise<void> {
         // Nothing to persist for commands, so refresh is the same as getItems
     }
 
@@ -30,13 +31,12 @@ export class CommandSearchProvider implements SearchProvider {
             // Get all available commands
             const commands = await vscode.commands.getCommands(true);
 
-            // Filter out internal commands
+            // Filter out internal/core IDE commands (allow extension commands, which use dots)
             const filteredCommands = commands.filter(cmd => {
                 return !cmd.startsWith('_') && // Internal command
                        !cmd.startsWith('vscode.') && // VS Code internal
                        !cmd.startsWith('workbench.') && // VS Code workbench
-                       !cmd.startsWith('editor.') && // Editor commands
-                       !cmd.includes('.'); // Often internal namespaced commands
+                       !cmd.startsWith('editor.');   // Editor commands
             });
 
             // Create command items
@@ -50,6 +50,7 @@ export class CommandSearchProvider implements SearchProvider {
                     command: command,
                     iconPath: new vscode.ThemeIcon('terminal-bash'),
                     action: async () => {
+                        Logger.log(`executeCommand command=${command}`);
                         await vscode.commands.executeCommand(command);
                     }
                 };

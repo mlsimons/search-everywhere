@@ -20,7 +20,8 @@ export function getConfiguration(): SearchEverywhereConfig {
         },
         performance: {
             maxResults: config.get<number>('performance.maxResults', 100),
-            maxTextResults: config.get<number>('performance.maxTextResults', 20)
+            maxTextResults: config.get<number>('performance.maxTextResults', 20),
+            maxDocumentSymbolFiles: config.get<number>('performance.maxDocumentSymbolFiles', 1000)
         },
         fuzzySearch: {
             library: config.get<string>('fuzzySearch.library', 'fuzzysort')

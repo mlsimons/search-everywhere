@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { FuzzySearcher, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider } from './types';
+import { FuzzySearcher, OnBatchCallback, SearchEverywhereConfig, SearchItem, SearchItemType, SearchProvider } from './types';
 import { FileSearchProvider } from '../providers/file-provider';
 import { CommandSearchProvider } from '../providers/command-provider';
 import { SymbolSearchProvider } from '../providers/symbol-provider';
@@ -8,6 +8,9 @@ import { TextSearchProvider } from '../providers/text-provider';
 import { getConfiguration } from '../utils/config';
 import { SearchFactory } from '../search/search-factory';
 import { Debouncer } from '../utils/debouncer';
+import Logger from '../utils/logging';
+import { getCacheFileUri, ensureCacheDir, readCache, writeCache, getWorkspaceFingerprint, CACHE_VERSION } from '../cache';
+import type { ActivityScoresCache } from '../cache';
 
 /**
  * Main service for coordinating search functionality
@@ -20,6 +23,15 @@ export class SearchService {
     private recentlyModifiedFiles: Map<string, number> = new Map(); // Uri -> timestamp
     private activityDebouncer: Debouncer;
     private indexUpdateDebouncer: Debouncer;
+    private activitySaveDebouncer: Debouncer;
+    /** Persisted selection timestamps (dedupe key -> Date.now()); applied to items when index is built */
+    private persistedActivityScores: Record<string, number> = {};
+    /** In-flight refresh promise so concurrent callers share one refresh instead of each starting their own */
+    private refreshPromise: Promise<void> | null = null;
+    /** True while the search quick pick is visible; we delay only the search-results update (see scheduleIndexUpdate) */
+    private searchUIActive: boolean = false;
+    /** Set when a search-results update was requested while searchUIActive; run when UI closes */
+    private pendingIndexUpdate: boolean = false;
 
     /**
      * Initialize the search service
@@ -34,6 +46,7 @@ export class SearchService {
         // Set up debouncers
         this.activityDebouncer = new Debouncer(500);
         this.indexUpdateDebouncer = new Debouncer(3500); // Wait a bit longer than provider refresh
+        this.activitySaveDebouncer = new Debouncer(2000);
 
         // Register search providers
         this.registerProviders();
@@ -71,26 +84,45 @@ export class SearchService {
     private watchFileChanges(): void {
         // Watch for file saves - the providers will refresh internally, we need to collect their results
         vscode.workspace.onDidSaveTextDocument(() => {
-            console.log('File saved, scheduling index update...');
+            Logger.log('File saved, scheduling index update...');
             this.scheduleIndexUpdate();
         });
 
         // Watch for file deletions, renames, etc.
         vscode.workspace.onDidCloseTextDocument(() => {
-            console.log('File closed, scheduling index update...');
+            // console.log('File closed, scheduling index update...');
             this.scheduleIndexUpdate();
         });
     }
 
     /**
-     * Schedule an index update, debounced to avoid too many updates
+     * Schedule a search-results update (merge provider data into allItems), debounced.
+     * Only this update is delayed while the search UI is active; providers still index in the
+     * background. Delaying just the results update keeps the list stable so accept goes to the right place.
      */
     private scheduleIndexUpdate(): void {
         this.indexUpdateDebouncer.debounce(() => {
-            console.log('Updating search index after file changes...');
-            // Pull the latest items from all providers without forcing a full refresh
+            if (this.searchUIActive) {
+                this.pendingIndexUpdate = true;
+                Logger.log('Search UI active: delaying search-results update (indexing continues in background)');
+                return;
+            }
+            Logger.log('Updating search results from providers...');
             this.updateIndexFromProviders();
         });
+    }
+
+    /**
+     * Notify the service when the search quick pick is shown or hidden.
+     * While active, only the search-results update is postponed; indexing in providers continues.
+     */
+    public setSearchUIActive(active: boolean): void {
+        this.searchUIActive = active;
+        if (!active && this.pendingIndexUpdate) {
+            this.pendingIndexUpdate = false;
+            Logger.log('Search UI closed: applying postponed search-results update');
+            void this.updateIndexFromProviders();
+        }
     }
 
     /**
@@ -100,13 +132,14 @@ export class SearchService {
     private async updateIndexFromProviders(): Promise<void> {
         // Temporary map to deduplicate items
         const deduplicationMap = new Map<string, SearchItem>();
+        Logger.log('Updating index from providers...');
 
         // Collect latest items from all providers
         for (const [name, provider] of this.providers.entries()) {
             try {
                 const items = await provider.getItems();
 
-                console.log(`Got ${items.length} items from ${name} provider after file change`);
+                Logger.log(`Got ${items.length} items from ${name} provider after file change`);
 
                 // Deduplicate items as they come in
                 for (const item of items) {
@@ -123,8 +156,71 @@ export class SearchService {
 
         // Update the allItems array with the latest items
         this.allItems = Array.from(deduplicationMap.values());
+        this.applyPersistedActivityScores();
 
-        console.log(`Index update completed: ${this.allItems.length} items (after deduplication)`);
+        Logger.log(`Index update completed: ${this.allItems.length} items (after deduplication)`);
+    }
+
+    /**
+     * Load persisted activity scores from cache so selections are remembered across sessions.
+     */
+    private async loadActivityScores(): Promise<void> {
+        const storageUri = this.context.storageUri;
+        const fileUri = getCacheFileUri(storageUri, 'activity-scores');
+        if (!fileUri) {
+            return;
+        }
+        const cache = await readCache<ActivityScoresCache>(fileUri);
+        if (!cache || cache.version !== CACHE_VERSION) {
+            return;
+        }
+        const fingerprint = getWorkspaceFingerprint();
+        if (cache.workspaceFingerprint !== undefined && cache.workspaceFingerprint !== fingerprint) {
+            return; // Different workspace, ignore
+        }
+        this.persistedActivityScores = cache.entries || {};
+        Logger.log(`Loaded ${Object.keys(this.persistedActivityScores).length} activity scores from cache`);
+    }
+
+    /**
+     * Persist activity scores to cache (debounced from recordItemUsed).
+     */
+    private static readonly MAX_PERSISTED_ACTIVITY_ENTRIES = 500;
+
+    private async saveActivityScores(): Promise<void> {
+        const storageUri = this.context.storageUri;
+        const fileUri = getCacheFileUri(storageUri, 'activity-scores');
+        if (!fileUri) {
+            return;
+        }
+        await ensureCacheDir(storageUri);
+        let entries = this.persistedActivityScores;
+        if (Object.keys(entries).length > SearchService.MAX_PERSISTED_ACTIVITY_ENTRIES) {
+            // Keep only the most recent entries by timestamp
+            const sorted = Object.entries(entries).sort((a, b) => b[1] - a[1]);
+            entries = Object.fromEntries(sorted.slice(0, SearchService.MAX_PERSISTED_ACTIVITY_ENTRIES));
+            this.persistedActivityScores = entries;
+        }
+        const payload: ActivityScoresCache = {
+            version: CACHE_VERSION,
+            workspaceFingerprint: getWorkspaceFingerprint(),
+            entries: { ...entries }
+        };
+        await writeCache(fileUri, payload);
+        Logger.debug(`Saved ${Object.keys(entries).length} activity scores to cache`);
+    }
+
+    /**
+     * Apply persisted activity scores to current allItems so boosting works after load/refresh.
+     */
+    private applyPersistedActivityScores(): void {
+        for (const item of this.allItems) {
+            const key = this.getDeduplicationKey(item);
+            const ts = this.persistedActivityScores[key];
+            if (typeof ts === 'number') {
+                item.activityScore = ts;
+            }
+        }
     }
 
     /**
@@ -168,26 +264,33 @@ export class SearchService {
      * Register all search providers
      */
     private registerProviders(): void {
+        const storageUri = this.context.storageUri;
+
         // Add file provider
         if (this.config.indexing.includeFiles) {
-            this.providers.set('files', new FileSearchProvider());
+            this.providers.set('files', new FileSearchProvider(storageUri));
+        } else {
+            Logger.log('File provider not registered (searchEverywhere.indexing.includeFiles is false)');
         }
 
         // Add symbol providers
         if (this.config.indexing.includeSymbols) {
-            this.providers.set('symbols', new SymbolSearchProvider());
-            this.providers.set('docSymbols', new DocumentSymbolProvider());
+            this.providers.set('symbols', new SymbolSearchProvider(storageUri));
+            this.providers.set('docSymbols', new DocumentSymbolProvider(storageUri));
         }
 
         // Add command provider
         if (this.config.indexing.includeCommands) {
             this.providers.set('commands', new CommandSearchProvider());
+        } else {
+            Logger.log('Command provider not registered (searchEverywhere.indexing.includeCommands is false)');
         }
 
         // Add text search provider
         if (this.config.indexing.includeText) {
             this.providers.set('text', new TextSearchProvider());
         }
+        Logger.debug(`Providers registered: ${[...this.providers.keys()].join(', ')} (includeFiles=${this.config.indexing.includeFiles}, includeCommands=${this.config.indexing.includeCommands}, includeSymbols=${this.config.indexing.includeSymbols}, includeText=${this.config.indexing.includeText})`);
     }
 
     /**
@@ -195,46 +298,96 @@ export class SearchService {
      * @param force If true, forces a complete reindex even if the provider is already refreshing
      */
     public async refreshIndex(force: boolean = false): Promise<void> {
-        // Clear existing items
-        this.allItems = [];
+        // If a refresh is already in progress, wait for it instead of starting another (avoids
+        // multiple "Workspace symbols: loaded from cache" and duplicate provider work)
+        if (this.refreshPromise !== null) {
+            if (!force) {
+                await this.refreshPromise;
+                return;
+            }
+            await this.refreshPromise;
+            this.refreshPromise = null;
+        }
 
-        // Refresh providers based on configuration
-        this.providers.clear();
-        this.registerProviders();
+        const doRefresh = async (): Promise<void> => {
+            await this.loadActivityScores();
 
-        // Temporary map to deduplicate items
-        const deduplicationMap = new Map<string, SearchItem>();
+            // Clear existing items
+            this.allItems = [];
 
-        // Collect items from all providers
-        for (const [name, provider] of this.providers.entries()) {
-            try {
-                // If force is true, we'll manually call refresh on each provider
-                if (force) {
-                    console.log(`Forcing refresh of ${name} provider...`);
-                    await provider.refresh();
-                }
+            // Refresh providers based on configuration
+            this.providers.clear();
+            this.registerProviders();
 
-                const items = await provider.getItems();
+            // Temporary map to deduplicate items
+            const deduplicationMap = new Map<string, SearchItem>();
 
-                console.log(`Got ${items.length} items from ${name} provider`);
-
-                // Deduplicate items as they come in
-                for (const item of items) {
+            // Helper: merge items into the index and update allItems (so search sees results as they stream)
+            const mergeBatch: OnBatchCallback = (batch: SearchItem[]) => {
+                for (const item of batch) {
                     const dedupeKey = this.getDeduplicationKey(item);
 
                     if (!deduplicationMap.has(dedupeKey)) {
                         deduplicationMap.set(dedupeKey, item);
                     }
                 }
-            } catch (error) {
-                console.error(`Error getting items from ${name} provider:`, error);
-            }
+                this.allItems = Array.from(deduplicationMap.values());
+            };
+
+            // Run all providers in parallel so the first results appear sooner (max latency instead of sum)
+            const providerEntries = [...this.providers.entries()];
+            await Promise.all(
+                providerEntries.map(async ([name, provider]) => {
+                    try {
+                        if (force) {
+                            Logger.log(`Forcing refresh of ${name} provider...`);
+                            await provider.refresh(true);
+                        }
+
+                        const items = await provider.getItems(mergeBatch);
+
+                        Logger.log(`Got ${items.length} items from ${name} provider`);
+
+                        // Merge final result (handles providers that don't stream; dedupe is idempotent)
+                        for (const item of items) {
+                            const dedupeKey = this.getDeduplicationKey(item);
+
+                            if (!deduplicationMap.has(dedupeKey)) {
+                                deduplicationMap.set(dedupeKey, item);
+                            }
+                        }
+                        this.allItems = Array.from(deduplicationMap.values());
+                    } catch (error) {
+                        console.error(`Error getting items from ${name} provider:`, error);
+                    }
+                })
+            );
+
+            Logger.log(`Indexing completed: ${this.allItems.length} items (after deduplication)`);
+            this.logItemCountsByType(this.allItems, 'after indexing');
+            this.applyPersistedActivityScores();
+        };
+
+        this.refreshPromise = doRefresh();
+        try {
+            await this.refreshPromise;
+        } finally {
+            this.refreshPromise = null;
         }
+    }
 
-        // Convert the deduplication map to the array
-        this.allItems = Array.from(deduplicationMap.values());
-
-        console.log(`Indexing completed: ${this.allItems.length} items (after deduplication)`);
+    /**
+     * Log counts per SearchItemType for debugging (e.g. why Files category is empty).
+     */
+    private logItemCountsByType(items: SearchItem[], context: string): void {
+        const counts: Record<string, number> = {};
+        for (const t of Object.values(SearchItemType)) {
+            counts[t] = 0;
+        }
+        for (const item of items) {
+            counts[item.type] = (counts[item.type] ?? 0) + 1;
+        }
+        Logger.debug(`Item counts ${context}: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(', ')}`);
     }
 
     /**
@@ -244,17 +397,15 @@ export class SearchService {
         // Normalize the label by removing parentheses from method names
         const normalizedLabel = item.label.replace(/\(\)$/, '');
 
-        if (item.type === SearchItemType.Symbol && 'uri' in item && 'range' in item) {
-            // For symbols, deduplicate based on name, uri, and position
-            const symbolItem = item as { uri: vscode.Uri, range: vscode.Range };
-
-            return `symbol:${normalizedLabel}:${symbolItem.uri.toString()}:${symbolItem.range.start.line}:${symbolItem.range.start.character}`;
-        } else if (item.type === SearchItemType.Class && 'uri' in item && 'range' in item) {
-            // For classes, deduplicate based on name, uri, and position
-            const classItem = item as { uri: vscode.Uri, range: vscode.Range };
-
-            return `class:${normalizedLabel}:${classItem.uri.toString()}:${classItem.range.start.line}:${classItem.range.start.character}`;
-        } else if (item.type === SearchItemType.File && 'uri' in item) {
+        // Prefer structure over type: anything with uri+range is a symbol/class for key purposes.
+        // This prevents document-symbol items (e.g. from cache with wrong type) from using file keys
+        // and overwriting file entries when docSymbols finishes merging.
+        if ('uri' in item && 'range' in item) {
+            const withRange = item as { uri: vscode.Uri; range: vscode.Range };
+            const prefix = item.type === SearchItemType.Class ? 'class' : 'symbol';
+            return `${prefix}:${normalizedLabel}:${withRange.uri.toString()}:${withRange.range.start.line}:${withRange.range.start.character}`;
+        }
+        if (item.type === SearchItemType.File && 'uri' in item) {
             // For files, deduplicate based on URI
             const fileItem = item as { uri: vscode.Uri };
 
@@ -271,6 +422,48 @@ export class SearchService {
     }
 
     /**
+     * Record that the user selected an item so it can be boosted in future results.
+     * Updates the selected item and any matching canonical item(s) in the index.
+     * This ensures that when the same name appears as both a text match and a symbol,
+     * selecting either one boosts the symbol in the Symbols tab (and in empty-query results).
+     */
+    public recordItemUsed(item: SearchItem): void {
+        const now = Date.now();
+        item.activityScore = now;
+
+        const key = this.getDeduplicationKey(item);
+        const normalizedLabel = item.label.replace(/\(\)$/, '');
+        let updatedCount = 0;
+
+        for (const indexed of this.allItems) {
+            if (indexed === item) {
+                indexed.activityScore = now;
+                this.persistedActivityScores[this.getDeduplicationKey(indexed)] = now;
+                updatedCount++;
+                continue;
+            }
+            if (this.getDeduplicationKey(indexed) === key) {
+                indexed.activityScore = now;
+                this.persistedActivityScores[this.getDeduplicationKey(indexed)] = now;
+                updatedCount++;
+            } else if (
+                (item.type === SearchItemType.TextMatch || item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) &&
+                (indexed.type === SearchItemType.Symbol || indexed.type === SearchItemType.Class) &&
+                indexed.label.replace(/\(\)$/, '') === normalizedLabel
+            ) {
+                indexed.activityScore = now;
+                this.persistedActivityScores[this.getDeduplicationKey(indexed)] = now;
+                updatedCount++;
+            }
+        }
+
+        if (updatedCount > 0) {
+            this.activitySaveDebouncer.debounce(() => void this.saveActivityScores());
+        }
+        Logger.debug(`recordItemUsed label=${item.label} type=${item.type} updatedIndexed=${updatedCount}`);
+    }
+
+    /**
      * Search for items matching the query
      */
     public async search(query: string): Promise<SearchItem[]> {
@@ -281,7 +474,7 @@ export class SearchService {
         let results: SearchItem[] = [];
 
         // Get text search results if enabled (these are always on-demand)
-        if (this.config.indexing.includeText && query.trim()) {
+            if (this.config.indexing.includeText && query.trim()) {
             try {
                 const textProvider = this.providers.get('text') as TextSearchProvider;
 
@@ -296,58 +489,73 @@ export class SearchService {
         }
         // If no query, return all indexed items
         if (!query.trim()) {
-            // Sort by priority for empty queries
             const sortedItems = [...this.allItems];
-
+            if (this.config.activity.enabled) {
+                this.boostRecentlyModifiedItems(sortedItems);
+            }
             this.sortResultsByPriority(sortedItems);
-
-            return sortedItems.slice(0, this.config.performance.maxResults);
+            this.logItemCountsByType(sortedItems, 'search (empty query)');
+            return sortedItems;
         }
-        // Perform fuzzy search on indexed items
-        const fuzzyResults = await this.searcher.search(
-            this.allItems,
-            query,
-            this.config.performance.maxResults
-        );
+        // Perform fuzzy search on indexed items (no limit - UI will apply maxResults when displaying)
+        const fuzzyResults = await this.searcher.search(this.allItems, query);
 
         // Combine fuzzy and text results
         results = [...results, ...fuzzyResults];
-        // Boost recently modified files
-        if (this.config.activity.enabled && this.recentlyModifiedFiles.size > 0) {
+        // Boost recently modified files and recently picked symbols (activityScore)
+        if (this.config.activity.enabled) {
             this.boostRecentlyModifiedItems(results);
         }
         // Apply priority-based sorting as a tie-breaker
         this.sortResultsByPriority(results);
 
-        // Limit to max results
-        return results.slice(0, this.config.performance.maxResults);
+        this.logItemCountsByType(results, 'search (with query)');
+        return results;
     }
 
     /**
-     * Sort search results by score and priority
-     * This ensures that higher priority items (like classes and methods)
-     * appear before lower priority items (like variables) when scores are similar
+     * Sort search results by score first, then by priority as tie-breaker.
+     * Score (including recency boost) dominates so e.g. a modified method can sort
+     * above a non-modified class; priority only decides when scores are effectively equal.
      */
     private sortResultsByPriority(results: SearchItem[]): void {
+        const SCORE_EPSILON = 1e-9;
         results.sort((a, b) => {
-            // If both items have scores and they differ significantly
-            if ('score' in a && 'score' in b &&
-                typeof a.score === 'number' && typeof b.score === 'number' &&
-                Math.abs(a.score - b.score) > 0.1) {
-                // Sort by score (higher score first)
-                return b.score - a.score;
+            // Recently used items (activityScore) always sort above others when they match the query
+            const hasActivityA = typeof a.activityScore === 'number' ? 1 : 0;
+            const hasActivityB = typeof b.activityScore === 'number' ? 1 : 0;
+            if (hasActivityB !== hasActivityA) {
+                return hasActivityB - hasActivityA; // With activity first
             }
-
-            // If scores are similar or not available, use priority as tie-breaker
-            const priorityA = a.priority || 50; // Default priority if not specified
+            // Among items with activity, most recently used first (higher timestamp = more recent)
+            if (hasActivityA === 1 && hasActivityB === 1) {
+                const tsA = a.activityScore ?? 0;
+                const tsB = b.activityScore ?? 0;
+                if (tsB !== tsA) {
+                    return tsB - tsA;
+                }
+            }
+            const scoreA = ('score' in a && typeof a.score === 'number') ? a.score : -Infinity;
+            const scoreB = ('score' in b && typeof b.score === 'number') ? b.score : -Infinity;
+            if (Math.abs(scoreA - scoreB) > SCORE_EPSILON) {
+                return scoreB - scoreA; // Higher score first
+            }
+            // Scores effectively equal: use priority as tie-breaker
+            const priorityA = a.priority || 50;
             const priorityB = b.priority || 50;
-
             return priorityB - priorityA; // Higher priority first
         });
+
+        // Debug: log top 5 result labels when we have activityScore in the set (to verify order)
+        const withActivity = results.filter(r => typeof r.activityScore === 'number');
+        if (withActivity.length > 0) {
+            Logger.debug(`sortResultsByPriority: top 5 = ${results.slice(0, 5).map(r => r.label).join(' | ')}`);
+        }
     }
 
     /**
-     * Boost items related to recently modified files
+     * Boost items related to recently modified files.
+     * Any item with a uri in recentlyModifiedFiles gets a higher score so they sort to the top.
      */
     private boostRecentlyModifiedItems(results: SearchItem[]): void {
         const activityWeight = this.config.activity.weight;
@@ -374,21 +582,37 @@ export class SearchService {
                     }
                 }
             }
-            // Boost symbols from recently modified files
-            else if (item.type === SearchItemType.Symbol && 'uri' in item) {
-                const symbolItem = item as { uri: vscode.Uri };
+            // Boost symbols in recently modified files (same file uri)
+            else if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) && 'uri' in item) {
+                const symbolItem = item as { uri: vscode.Uri; score?: number };
                 const timestamp = this.recentlyModifiedFiles.get(symbolItem.uri.toString());
-
-                if (timestamp) {
+                if (timestamp && 'score' in item && typeof item.score === 'number') {
                     const age = now - timestamp;
                     const recencyScore = Math.max(0, 1 - (age / oneHour));
-                    const boost = 1 + (recencyScore * activityWeight * 0.5); // Slightly less boost for symbols
-
-                    if ('score' in item && typeof item.score === 'number') {
-                        item.score *= boost;
-                    }
+                    const boost = 1 + (recencyScore * activityWeight * 0.8); // Slightly lower than files
+                    item.score *= boost;
                 }
             }
+            // Boost symbols when they have been recently used (activityScore set)
+            // Use a stronger factor (1.5) so recently picked items reliably sort to the top when they match the query
+            if ((item.type === SearchItemType.Symbol || item.type === SearchItemType.Class) && typeof item.activityScore === 'number') {
+                const timestamp = item.activityScore; // Date.now() when the symbol was used
+                const age = now - timestamp;
+                const recencyScore = Math.max(0, 1 - (age / oneHour));
+                const boost = 1 + (recencyScore * activityWeight * 1.5);
+
+                if ('score' in item && typeof item.score === 'number') {
+                    item.score *= boost;
+                    // Add a small additive boost so recently used items beat similar fuzzy scores
+                    item.score += recencyScore * 0.4;
+                }
+            }
+        }
+        const activityCount = results.filter(
+            r => (r.type === SearchItemType.Symbol || r.type === SearchItemType.Class) && typeof r.activityScore === 'number'
+        ).length;
+        if (activityCount > 0) {
+            Logger.debug(`boostRecentlyModifiedItems: ${activityCount} symbol(s) had activityScore and were boosted`);
         }
     }
 

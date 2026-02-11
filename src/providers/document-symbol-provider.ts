@@ -1,7 +1,18 @@
 import * as vscode from 'vscode';
-import { SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, mapSymbolKindToGroup } from '../core/types';
+import { OnBatchCallback, SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, mapSymbolKindToGroup } from '../core/types';
 import { Debouncer } from '../utils/debouncer';
 import { ExclusionPatterns } from '../utils/exclusions';
+import { getConfiguration } from '../utils/config';
+import {
+    CACHE_VERSION,
+    getCacheFileUri,
+    getWorkspaceFingerprint,
+    ensureCacheDir,
+    readCache,
+    writeCache
+} from '../cache';
+import type { DocumentSymbolsCache, DocumentSymbolsFileEntry, SerializedSymbolItem } from '../cache';
+import Logger from '../utils/logging';
 
 /**
  * Provides document symbols for searching by scanning each file individually
@@ -11,12 +22,18 @@ export class DocumentSymbolProvider implements SearchProvider {
     private symbolItems: SymbolSearchItem[] = [];
     private isRefreshing: boolean = false;
     private refreshDebouncer: Debouncer;
+    /** URIs updated by updateDocumentSymbols since last incremental cache save */
+    private dirtyDocSymbolUris = new Set<string>();
+    private saveCacheDebouncer: Debouncer;
     private fileUriCache = new Set<string>();
+    private readonly storageUri: vscode.Uri | undefined;
 
-    constructor() {
+    constructor(storageUri?: vscode.Uri) {
+        this.storageUri = storageUri;
         // Create a debouncer with 3 second delay to avoid excessive refreshes
         // Using a slightly longer delay than workspace symbols to stagger the operations
         this.refreshDebouncer = new Debouncer(3000);
+        this.saveCacheDebouncer = new Debouncer(800);
 
         // Setup automatic reindexing when documents change
         this.setupChangeListeners();
@@ -61,30 +78,69 @@ export class DocumentSymbolProvider implements SearchProvider {
             );
 
             // Get document symbols for the file
+            Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
             const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                 'vscode.executeDocumentSymbolProvider',
                 uri
             );
 
             if (symbols && symbols.length > 0) {
-                // Add the file URI to our cache
                 this.fileUriCache.add(uri.toString());
-
-                // Process symbols recursively
                 this.processSymbols(symbols, uri);
-
-                console.log(`Updated ${symbols.length} symbols for ${uri.fsPath}`);
+                Logger.log(`Updated ${symbols.length} symbols for ${uri.fsPath}`);
             }
+            // Persist cache so next load avoids re-executing executeDocumentSymbolProvider for this file
+            // (including when symbols are now empty so we don't re-query on next load)
+            this.dirtyDocSymbolUris.add(uri.toString());
+            this.saveCacheDebouncer.debounce(() => this.flushIncrementalCacheSave());
         } catch (error) {
             console.error(`Error updating symbols for ${uri.fsPath}:`, error);
         }
     }
 
     /**
+     * Persist cache after incremental updates. Uses existing cache and patches only
+     * dirty file entries to avoid expensive getSourceFileEntries() on every save.
+     */
+    private async flushIncrementalCacheSave(): Promise<void> {
+        const uris = new Set(this.dirtyDocSymbolUris);
+        this.dirtyDocSymbolUris.clear();
+        if (uris.size === 0 || !this.storageUri) {
+            return;
+        }
+        const fileUri = getCacheFileUri(this.storageUri, 'document-symbols');
+        if (!fileUri) {
+            return;
+        }
+        const cache = await readCache<DocumentSymbolsCache>(fileUri);
+        const fingerprint = getWorkspaceFingerprint();
+        if (!cache || cache.version !== CACHE_VERSION || cache.workspaceFingerprint !== fingerprint || !cache.files) {
+            await this.saveCache();
+            return;
+        }
+        for (const uriStr of uris) {
+            try {
+                const uri = vscode.Uri.parse(uriStr);
+                const stat = await vscode.workspace.fs.stat(uri);
+                const items = this.symbolItems.filter((item) => item.uri.toString() === uriStr);
+                cache.files[uriStr] = {
+                    mtime: stat.mtime,
+                    symbols: items.map((item) => this.serializeSymbolItem(item))
+                };
+            } catch {
+                // File may have been deleted; leave cache entry as-is or remove
+                delete cache.files[uriStr];
+            }
+        }
+        await ensureCacheDir(this.storageUri);
+        await writeCache(fileUri, cache);
+    }
+
+    /**
      * Schedule a full refresh operation, debounced to prevent excessive updates
      */
     private scheduleRefresh(): void {
-        console.log('Scheduling document symbol index refresh...');
+        Logger.log('Scheduling document symbol index refresh...');
         this.refreshDebouncer.debounce(() => {
             this.refresh();
         });
@@ -104,27 +160,30 @@ export class DocumentSymbolProvider implements SearchProvider {
     }
 
     /**
-     * Get all indexed document symbol items
+     * Get all indexed document symbol items.
+     * When onBatch is provided, it is called after each batch of files is indexed so results are available immediately.
      */
-    public async getItems(): Promise<SymbolSearchItem[]> {
+    public async getItems(onBatch?: OnBatchCallback): Promise<SymbolSearchItem[]> {
         if (this.symbolItems.length === 0 && !this.isRefreshing) {
-            await this.refresh();
+            await this.refresh(false, onBatch);
         }
 
         return this.symbolItems;
     }
 
     /**
-     * Refresh the document symbol index by scanning documents in the workspace
-     * @param force If true, forces refresh even if already refreshing
+     * Refresh the document symbol index by scanning documents in the workspace.
+     * Uses persistent cache when possible; only re-indexes new or modified files.
+     * @param force If true, forces refresh even if already refreshing and ignores cache
+     * @param onBatch When provided, called after each batch of files with the newly indexed symbols (for streaming results)
      */
-    public async refresh(force: boolean = false): Promise<void> {
+    public async refresh(force: boolean = false, onBatch?: OnBatchCallback): Promise<void> {
         if (this.isRefreshing && !force) {
             return;
         }
 
         this.isRefreshing = true;
-        console.log('Refreshing document symbol index...');
+        Logger.log('Refreshing document symbol index...');
         const startTime = performance.now();
 
         this.symbolItems = [];
@@ -134,38 +193,17 @@ export class DocumentSymbolProvider implements SearchProvider {
                 return;
             }
 
-            // Find source code files to scan for symbols
-            // Focus on common source code extensions to avoid scanning too many files
-            const sourceFilePattern = '**/*.{js,jsx,ts,tsx,py,java,c,cpp,cs,go,rb,php,rust,swift}';
-
-            // Get exclusion pattern from utility
-            const excludePattern = ExclusionPatterns.getExclusionGlob();
-
-            for (const folder of vscode.workspace.workspaceFolders) {
-                // Find source code files in this workspace folder
-                const files = await vscode.workspace.findFiles(
-                    new vscode.RelativePattern(folder, sourceFilePattern),
-                    excludePattern
-                );
-
-                console.log(`Found ${files.length} source files in ${folder.name}`);
-
-                // Process max 300 files to avoid performance issues
-                const filesToProcess = files.slice(0, 300);
-
-                // Process files in batches to avoid UI freezes
-                const batchSize = 20;
-
-                for (let i = 0; i < filesToProcess.length; i += batchSize) {
-                    const batch = filesToProcess.slice(i, i + batchSize);
-
-                    await this.processFileBatch(batch);
-
-                    // Log progress
-                    if (i % 100 === 0 && i > 0) {
-                        console.log(`Processed ${i} files...`);
-                    }
+            if (force || !this.storageUri) {
+                await this.fullRefresh(onBatch);
+            } else {
+                const usedCache = await this.refreshFromCacheOrFull(onBatch);
+                if (!usedCache) {
+                    await this.fullRefresh(onBatch);
                 }
+            }
+
+            if (this.storageUri) {
+                await this.saveCache();
             }
         } catch (error) {
             console.error('Error refreshing document symbol index:', error);
@@ -174,8 +212,306 @@ export class DocumentSymbolProvider implements SearchProvider {
 
             const endTime = performance.now();
 
-            console.log(`Indexed ${this.symbolItems.length} document symbols in ${endTime - startTime}ms`);
+            Logger.log(`Indexed ${this.symbolItems.length} document symbols in ${endTime - startTime}ms`);
         }
+    }
+
+    /**
+     * Get source file URIs and mtimes using the same discovery logic as full refresh.
+     */
+    private async getSourceFileEntries(): Promise<{ uri: vscode.Uri; mtime: number }[]> {
+        const sourceFilePattern = '**/*.{js,jsx,ts,tsx,py,java,c,cpp,cs,go,rb,php,rust,swift}';
+        const excludePattern = ExclusionPatterns.getExclusionGlob();
+        const { maxDocumentSymbolFiles } = getConfiguration().performance;
+        const entries: { uri: vscode.Uri; mtime: number }[] = [];
+
+        for (const folder of vscode.workspace.workspaceFolders!) {
+            let files = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(folder, sourceFilePattern),
+                excludePattern
+            );
+            files = await this.sortFilesByModifiedDate(files);
+            const filesToProcess = files.slice(0, maxDocumentSymbolFiles);
+
+            const batchSize = 500;
+            for (let i = 0; i < filesToProcess.length; i += batchSize) {
+                const batch = filesToProcess.slice(i, i + batchSize);
+                const stats = await Promise.all(
+                    batch.map(async (uri) => {
+                        try {
+                            const stat = await vscode.workspace.fs.stat(uri);
+                            return { uri, mtime: stat.mtime };
+                        } catch {
+                            return { uri, mtime: 0 };
+                        }
+                    })
+                );
+                entries.push(...stats);
+                if (i + batchSize < filesToProcess.length) {
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                }
+            }
+        }
+        return entries;
+    }
+
+    /**
+     * Try to load from cache and do incremental update. Returns true if cache was used.
+     */
+    private async refreshFromCacheOrFull(onBatch?: OnBatchCallback): Promise<boolean> {
+        const fileUri = getCacheFileUri(this.storageUri, 'document-symbols');
+        if (!fileUri) {
+            return false;
+        }
+
+        const cache = await readCache<DocumentSymbolsCache>(fileUri);
+        const fingerprint = getWorkspaceFingerprint();
+        if (!cache || cache.version !== CACHE_VERSION || cache.workspaceFingerprint !== fingerprint) {
+            return false;
+        }
+
+        const currentEntries = await this.getSourceFileEntries();
+        const currentUriSet = new Set(currentEntries.map((e) => e.uri.toString()));
+        const cachedFiles = cache.files || {};
+
+        let fromCache = 0;
+        const toIndex: { uri: vscode.Uri; mtime: number }[] = [];
+
+        for (const { uri, mtime } of currentEntries) {
+            const uriStr = uri.toString();
+            const entry = cachedFiles[uriStr];
+            if (entry && entry.mtime === mtime && entry.symbols.length >= 0) {
+                for (const s of entry.symbols) {
+                    this.symbolItems.push(this.deserializeSymbolItem(s));
+                }
+                fromCache++;
+            } else {
+                toIndex.push({ uri, mtime });
+            }
+        }
+
+        if (toIndex.length > 0) {
+            const batchSize = 20;
+                for (let i = 0; i < toIndex.length; i += batchSize) {
+                const batch = toIndex.slice(i, i + batchSize);
+                const countBefore = this.symbolItems.length;
+                for (const { uri } of batch) {
+                    if (ExclusionPatterns.shouldExclude(uri)) {
+                        continue;
+                    }
+                    try {
+                        Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
+                        const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+                            'vscode.executeDocumentSymbolProvider',
+                            uri
+                        );
+                        if (symbols && symbols.length > 0) {
+                            this.processSymbols(symbols, uri);
+                        }
+                    } catch (err) {
+                        console.error(`Error indexing ${uri.fsPath}:`, err);
+                    }
+                }
+                if (onBatch && this.symbolItems.length > countBefore) {
+                    onBatch(this.symbolItems.slice(countBefore));
+                }
+                if (this.storageUri) {
+                    await this.saveCache();
+                }
+                if (i % 100 === 0 && i > 0) {
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                }
+            }
+        }
+
+        Logger.log(`Document symbols: ${fromCache} files from cache, ${toIndex.length} re-indexed`);
+        return true;
+    }
+
+    private async fullRefresh(onBatch?: OnBatchCallback): Promise<void> {
+        const currentEntries = await this.getSourceFileEntries();
+
+        let cachedFiles: Record<string, DocumentSymbolsFileEntry> = {};
+        if (this.storageUri) {
+            const fileUri = getCacheFileUri(this.storageUri, 'document-symbols');
+            if (fileUri) {
+                const cache = await readCache<DocumentSymbolsCache>(fileUri);
+                const fingerprint = getWorkspaceFingerprint();
+                if (cache && cache.version === CACHE_VERSION && cache.workspaceFingerprint === fingerprint && cache.files) {
+                    cachedFiles = cache.files;
+                }
+            }
+        }
+
+        let fromCacheCount = 0;
+        const toProcess: { uri: vscode.Uri; mtime: number }[] = [];
+
+        for (const { uri, mtime } of currentEntries) {
+            const uriStr = uri.toString();
+            const entry = cachedFiles[uriStr];
+            if (entry && entry.mtime === mtime && entry.symbols.length >= 0) {
+                for (const s of entry.symbols) {
+                    this.symbolItems.push(this.deserializeSymbolItem(s));
+                }
+                fromCacheCount++;
+            } else {
+                if (!ExclusionPatterns.shouldExclude(uri)) {
+                    toProcess.push({ uri, mtime });
+                }
+            }
+        }
+
+        if (onBatch && fromCacheCount > 0) {
+            onBatch([...this.symbolItems]);
+        }
+
+        const batchSize = 20;
+        for (let i = 0; i < toProcess.length; i += batchSize) {
+            const batch = toProcess.slice(i, i + batchSize).map((e) => e.uri);
+            Logger.log(`Processing batch ${JSON.stringify(batch)}...`);
+            const countBefore = this.symbolItems.length;
+
+            await this.processFileBatch(batch);
+
+            if (onBatch && this.symbolItems.length > countBefore) {
+                onBatch(this.symbolItems.slice(countBefore));
+            }
+
+            if (this.storageUri) {
+                await this.saveCache();
+            }
+
+            if (i % 100 === 0 && i > 0) {
+                Logger.log(`Processed ${i} files...`);
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+        }
+
+        Logger.log(`Document symbols: ${fromCacheCount} files from cache, ${toProcess.length} re-indexed`);
+    }
+
+    private async saveCache(): Promise<void> {
+        const fileUri = getCacheFileUri(this.storageUri, 'document-symbols');
+        if (!fileUri) {
+            return;
+        }
+
+        await ensureCacheDir(this.storageUri);
+
+        const currentEntries = await this.getSourceFileEntries();
+        const uriToMtime = new Map(currentEntries.map((e) => [e.uri.toString(), e.mtime]));
+
+        const symbolsByUri = new Map<string, SymbolSearchItem[]>();
+        for (const item of this.symbolItems) {
+            const uriStr = item.uri.toString();
+            if (!symbolsByUri.has(uriStr)) {
+                symbolsByUri.set(uriStr, []);
+            }
+            symbolsByUri.get(uriStr)!.push(item);
+        }
+
+        // Write a cache entry for every file we consider (including 0-symbol files) so we don't re-execute on next load
+        const files: Record<string, DocumentSymbolsFileEntry> = {};
+        for (const { uri } of currentEntries) {
+            const uriStr = uri.toString();
+            const mtime = uriToMtime.get(uriStr) ?? 0;
+            const items = symbolsByUri.get(uriStr) ?? [];
+            files[uriStr] = {
+                mtime,
+                symbols: items.map((item) => this.serializeSymbolItem(item))
+            };
+        }
+
+        const payload: DocumentSymbolsCache = {
+            version: CACHE_VERSION,
+            workspaceFingerprint: getWorkspaceFingerprint(),
+            files
+        };
+
+        await writeCache(fileUri, payload);
+    }
+
+    private serializeSymbolItem(item: SymbolSearchItem): SerializedSymbolItem {
+        return {
+            id: item.id,
+            label: item.label,
+            description: item.description,
+            detail: item.detail,
+            type: item.type as 'symbol' | 'class',
+            uri: item.uri.toString(),
+            range: {
+                start: { line: item.range.start.line, character: item.range.start.character },
+                end: { line: item.range.end.line, character: item.range.end.character }
+            },
+            symbolKind: item.symbolKind as number,
+            symbolGroup: item.symbolGroup !== undefined ? (item.symbolGroup as number) : undefined,
+            priority: item.priority
+        };
+    }
+
+    private deserializeSymbolItem(s: SerializedSymbolItem): SymbolSearchItem {
+        const uri = vscode.Uri.parse(s.uri);
+        const range = new vscode.Range(
+            s.range.start.line,
+            s.range.start.character,
+            s.range.end.line,
+            s.range.end.character
+        );
+        // Coerce type to symbol or class only (never 'file') so cache corruption/old format cannot
+        // produce items that overwrite file entries in the search index deduplication map.
+        const type = s.type === 'class' ? SearchItemType.Class : SearchItemType.Symbol;
+        return {
+            id: s.id,
+            label: s.label,
+            description: s.description,
+            detail: s.detail,
+            type,
+            uri,
+            range,
+            symbolKind: s.symbolKind as vscode.SymbolKind,
+            symbolGroup: s.symbolGroup !== undefined ? (s.symbolGroup as SymbolKindGroup) : undefined,
+            priority: s.priority,
+            iconPath: this.getSymbolIcon(s.symbolKind as vscode.SymbolKind),
+            action: async () => {
+                const document = await vscode.workspace.openTextDocument(uri);
+                const editor = await vscode.window.showTextDocument(document);
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+            }
+        };
+    }
+
+    /**
+     * Sort files by last modified date (newest first) so recently edited files get indexed first
+     */
+    private async sortFilesByModifiedDate(files: vscode.Uri[]): Promise<vscode.Uri[]> {
+        if (files.length === 0) {
+            return files;
+        }
+
+        const batchSize = 500;
+        const entries: { uri: vscode.Uri; mtime: number }[] = [];
+
+        for (let i = 0; i < files.length; i += batchSize) {
+            const batch = files.slice(i, i + batchSize);
+            const stats = await Promise.all(
+                batch.map(async (uri) => {
+                    try {
+                        const stat = await vscode.workspace.fs.stat(uri);
+                        return { uri, mtime: stat.mtime };
+                    } catch {
+                        return { uri, mtime: 0 };
+                    }
+                })
+            );
+            entries.push(...stats);
+            if (i + batchSize < files.length) {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+        }
+
+        entries.sort((a, b) => b.mtime - a.mtime);
+        return entries.map((e) => e.uri);
     }
 
     /**
@@ -190,6 +526,7 @@ export class DocumentSymbolProvider implements SearchProvider {
                 }
 
                 // Get document symbols using VSCode's document symbol provider
+                Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
                 const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                     'vscode.executeDocumentSymbolProvider',
                     uri
@@ -209,50 +546,47 @@ export class DocumentSymbolProvider implements SearchProvider {
     }
 
     /**
-     * Process symbols recursively
+     * Process symbols iteratively using an explicit stack to avoid stack overflow
+     * when document symbol trees are very deeply nested.
      */
     private processSymbols(symbols: vscode.DocumentSymbol[], uri: vscode.Uri, containerName: string = ''): void {
-        for (const symbol of symbols) {
-            // Determine symbol group
-            const symbolGroup = mapSymbolKindToGroup(symbol.kind);
+        type StackEntry = { symbols: vscode.DocumentSymbol[]; containerName: string };
+        const stack: StackEntry[] = [{ symbols, containerName }];
 
-            // Determine if this is a class-like symbol
-            const isClass = symbolGroup === SymbolKindGroup.Class;
+        while (stack.length > 0) {
+            const { symbols: currentSymbols, containerName: currentContainer } = stack.pop()!;
 
-            // Get priority based on symbol kind
-            const priority = this.getSymbolPriority(symbol.kind);
+            for (const symbol of currentSymbols) {
+                const symbolGroup = mapSymbolKindToGroup(symbol.kind);
+                const isClass = symbolGroup === SymbolKindGroup.Class;
+                const priority = this.getSymbolPriority(symbol.kind);
 
-            // Create a symbol item
-            const symbolItem: SymbolSearchItem = {
-                id: `symbol:${symbol.name}:${uri.toString()}:${symbol.range.start.line}:${symbol.range.start.character}`,
-                label: symbol.name,
-                description: `${this.getSymbolKindName(symbol.kind)}${containerName ? ` - ${containerName}` : ''}`,
-                detail: uri.fsPath,
-                type: isClass ? SearchItemType.Class : SearchItemType.Symbol,
-                uri: uri,
-                range: symbol.range,
-                symbolKind: symbol.kind,
-                symbolGroup: symbolGroup,
-                priority: priority,
-                iconPath: this.getSymbolIcon(symbol.kind),
-                action: async () => {
-                    // Open document and reveal the symbol's position
-                    const document = await vscode.workspace.openTextDocument(uri);
-                    const editor = await vscode.window.showTextDocument(document);
+                const symbolItem: SymbolSearchItem = {
+                    id: `symbol:${symbol.name}:${uri.toString()}:${symbol.range.start.line}:${symbol.range.start.character}`,
+                    label: symbol.name,
+                    description: `${this.getSymbolKindName(symbol.kind)}${currentContainer ? ` - ${currentContainer}` : ''}`,
+                    detail: uri.fsPath,
+                    type: isClass ? SearchItemType.Class : SearchItemType.Symbol,
+                    uri: uri,
+                    range: symbol.range,
+                    symbolKind: symbol.kind,
+                    symbolGroup: symbolGroup,
+                    priority: priority,
+                    iconPath: this.getSymbolIcon(symbol.kind),
+                    action: async () => {
+                        const document = await vscode.workspace.openTextDocument(uri);
+                        const editor = await vscode.window.showTextDocument(document);
+                        const range = symbol.selectionRange;
+                        editor.selection = new vscode.Selection(range.start, range.start);
+                        editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                    }
+                };
 
-                    // Position the cursor at the symbol and reveal it
-                    const range = symbol.selectionRange;
+                this.symbolItems.push(symbolItem);
 
-                    editor.selection = new vscode.Selection(range.start, range.start);
-                    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                if (symbol.children && symbol.children.length > 0) {
+                    stack.push({ symbols: symbol.children, containerName: symbol.name });
                 }
-            };
-
-            this.symbolItems.push(symbolItem);
-
-            // Process children recursively
-            if (symbol.children && symbol.children.length > 0) {
-                this.processSymbols(symbol.children, uri, symbol.name);
             }
         }
     }

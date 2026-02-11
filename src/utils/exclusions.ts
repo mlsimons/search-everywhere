@@ -3,6 +3,7 @@ import { getConfiguration } from './config';
 import Logger from './logging';
 import { minimatch } from 'minimatch';
 
+const DEBUG_EXCLUSIONS = false;
 /**
  * Utility for managing exclusion patterns that are shared across providers
  */
@@ -86,15 +87,19 @@ export class ExclusionPatterns {
         if (config.exclusions && Array.isArray(config.exclusions)) {
             const allPatterns = [...defaultPatterns, ...config.exclusions];
 
-            Logger.debug(`Loaded exclusion patterns - Default: ${defaultPatterns.length}, User: ${config.exclusions.length}, Total: ${allPatterns.length}`);
-            if (config.debug && config.exclusions.length > 0) {
+            if (DEBUG_EXCLUSIONS) {
+                Logger.debug(`Loaded exclusion patterns - Default: ${defaultPatterns.length}, User: ${config.exclusions.length}, Total: ${allPatterns.length}`);
+            }
+            if (DEBUG_EXCLUSIONS && config.debug && config.exclusions.length > 0) {
                 Logger.debug(`User-configured exclusions: ${config.exclusions.join(', ')}`);
             }
 
             return allPatterns;
         }
 
-        Logger.debug(`Loaded exclusion patterns - Default: ${defaultPatterns.length}, User: 0, Total: ${defaultPatterns.length}`);
+        if (DEBUG_EXCLUSIONS) {
+            Logger.debug(`Loaded exclusion patterns - Default: ${defaultPatterns.length}, User: 0, Total: ${defaultPatterns.length}`);
+        }
 
         return defaultPatterns;
     }
@@ -106,7 +111,9 @@ export class ExclusionPatterns {
         const patterns = this.getExclusionPatterns();
         const glob = `{${patterns.join(',')}}`;
 
-        Logger.debug(`Generated exclusion glob pattern with ${patterns.length} patterns`);
+        if (DEBUG_EXCLUSIONS) {
+            Logger.debug(`Generated exclusion glob pattern with ${patterns.length} patterns`);
+        }
 
         return glob;
     }
@@ -117,7 +124,9 @@ export class ExclusionPatterns {
     public static shouldExclude(uri: vscode.Uri): boolean {
         // Don't exclude non-file URIs (like symbols)
         if (uri.scheme !== 'file') {
-            Logger.debug(`Skipping exclusion check for non-file URI: ${uri.toString()} (scheme: ${uri.scheme})`);
+            if (DEBUG_EXCLUSIONS) {
+                Logger.debug(`Skipping exclusion check for non-file URI: ${uri.toString()} (scheme: ${uri.scheme})`);
+            }
 
             return false;
         }
@@ -139,12 +148,16 @@ export class ExclusionPatterns {
             });
 
             if (matches) {
-                Logger.debug(`Excluded: ${relativePath} (matched pattern: ${pattern})`);
+                if (DEBUG_EXCLUSIONS) {
+                    Logger.debug(`Excluded: ${relativePath} (matched pattern: ${pattern})`);
+                }
 
                 return true;
             }
         }
-        Logger.debug(`Included: ${relativePath}`);
+        if (DEBUG_EXCLUSIONS) {
+            Logger.debug(`Included: ${relativePath}`);
+        }
 
         return false;
     }

@@ -1,3 +1,11 @@
+// BufferSource is used by @msgpack/msgpack .d.ts but comes from DOM lib; we only use ES2022 lib.
+type BufferSource = ArrayBuffer | ArrayBufferView;
+
+declare module '@msgpack/msgpack' {
+    export function encode(data: unknown): Uint8Array;
+    export function decode(data: Uint8Array): unknown;
+}
+
 declare module 'fuzzaldrin-plus' {
     export function filter(candidates: any[], query: string, options?: { key?: string; maxResults?: number }): any[];
     export function score(string: string, query: string): number;

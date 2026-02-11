@@ -1,4 +1,5 @@
-import { FuzzySearcher, SearchItem } from '../core/types';
+import { FuzzySearcher, FuzzySearchOptions, SearchItem } from '../core/types';
+import Logger from '../utils/logging';
 // @ts-ignore - Import with require to avoid TypeScript issues
 const fuzzysort = require('fuzzysort');
 
@@ -11,9 +12,12 @@ export class FuzzysortAdapter implements FuzzySearcher {
     /**
      * Search items using fuzzysort
      */
-    public async search(items: SearchItem[], query: string, limit = 100): Promise<SearchItem[]> {
+    public async search(items: SearchItem[], query: string, limit?: number, options?: FuzzySearchOptions): Promise<SearchItem[]> {
+        // When limit is not provided, return all matches (display limit is applied in UI only)
+        const effectiveLimit = limit ?? Number.MAX_SAFE_INTEGER;
+
         if (!query.trim()) {
-            return items.slice(0, limit);
+            return items.slice(0, effectiveLimit);
         }
 
         const startTime = performance.now();
@@ -29,10 +33,12 @@ export class FuzzysortAdapter implements FuzzySearcher {
             };
         });
 
+        const goLimit = effectiveLimit === Number.MAX_SAFE_INTEGER ? undefined : effectiveLimit * 2;
+
         // @ts-ignore - We're using the library in a way that TypeScript can't validate
         const results = fuzzysort.go(query, targets, {
             key: 'searchText',
-            limit: limit * 2
+            ...(goLimit !== undefined && { limit: goLimit })
         });
 
         // Map results back to items
@@ -47,8 +53,8 @@ export class FuzzysortAdapter implements FuzzySearcher {
 
         const endTime = performance.now();
 
-        console.log(`Fuzzysort search took ${endTime - startTime}ms for ${items.length} items`);
+        Logger.log(`Fuzzysort search took ${endTime - startTime}ms for ${items.length} items`);
 
-        return foundItems.slice(0, limit);
+        return foundItems.slice(0, effectiveLimit);
     }
 }

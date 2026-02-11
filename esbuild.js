@@ -24,12 +24,13 @@ const esbuildProblemMatcherPlugin = {
 };
 
 async function main() {
-	const ctx = await esbuild.context({
+		const ctx = await esbuild.context({
 		entryPoints: [
 			'src/extension.ts'
 		],
 		bundle: true,
 		format: 'cjs',
+		target: 'es2023',
 		minify: production,
 		sourcemap: !production,
 		sourcesContent: false,

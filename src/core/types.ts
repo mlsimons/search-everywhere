@@ -116,19 +116,38 @@ export interface TextMatchItem extends SearchItem {
 }
 
 /**
+ * Options passed to fuzzy search (e.g. from config)
+ */
+export interface FuzzySearchOptions {
+    // Reserved for future options
+}
+
+/**
  * Interface for fuzzy searchers
  */
 export interface FuzzySearcher {
     name: string;
-    search(items: SearchItem[], query: string, limit?: number): Promise<SearchItem[]>;
+    search(items: SearchItem[], query: string, limit?: number, options?: FuzzySearchOptions): Promise<SearchItem[]>;
 }
+
+/**
+ * Optional callback for providers that stream results as they are indexed.
+ * When provided, the provider may call it with batches of items (e.g. after each file or batch of files).
+ */
+export type OnBatchCallback = (items: SearchItem[]) => void;
 
 /**
  * Interface for search providers
  */
 export interface SearchProvider {
-    getItems(): Promise<SearchItem[]>;
-    refresh(): Promise<void>;
+    /**
+     * Get all items. If onBatch is provided, the provider may call it with batches of items
+     * as they become available (e.g. after each file is indexed). The promise still resolves
+     * with the full list when indexing is complete.
+     */
+    getItems(onBatch?: OnBatchCallback): Promise<SearchItem[]>;
+    /** @param force If true, ignore cache and do a full re-index */
+    refresh(force?: boolean): Promise<void>;
 }
 
 /**
@@ -148,6 +167,8 @@ export interface SearchEverywhereConfig {
     performance: {
         maxResults: number;
         maxTextResults: number;
+        /** Max number of source files to scan for document symbols (private methods, etc.). */
+        maxDocumentSymbolFiles: number;
     };
     fuzzySearch: {
         library: string;

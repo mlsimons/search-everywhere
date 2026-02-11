@@ -31,7 +31,7 @@ export class TextSearchProvider implements SearchProvider {
     /**
      * Get the current search results
      */
-    public async getItems(): Promise<TextMatchItem[]> {
+    public async getItems(_onBatch?: import('../core/types').OnBatchCallback): Promise<TextMatchItem[]> {
         return this.searchResults;
     }
 
@@ -39,7 +39,7 @@ export class TextSearchProvider implements SearchProvider {
      * Refresh implementation (required by SearchProvider interface)
      * For text search, refreshing does nothing as searches are on-demand
      */
-    public async refresh(): Promise<void> {
+    public async refresh(_force?: boolean): Promise<void> {
         // Text searches are performed on demand, so no need to refresh
         this.searchResults = [];
 

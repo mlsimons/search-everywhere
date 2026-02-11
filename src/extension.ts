@@ -11,8 +11,6 @@ export function activate(context: vscode.ExtensionContext) {
 	Logger.initialize();
 	Logger.debug('Search Everywhere extension activated');
 
-	console.log('Activating Search Everywhere extension...');
-
 	// Create the search service
 	const searchService = new SearchService(context);
 
@@ -22,6 +20,14 @@ export function activate(context: vscode.ExtensionContext) {
 	// Register search command
 	const searchDisposable = vscode.commands.registerCommand('search-everywhere.search', () => {
 		searchUI.show();
+	});
+
+	// Register Tab / Shift+Tab to cycle filter (when quick pick is visible)
+	const nextFilterDisposable = vscode.commands.registerCommand('search-everywhere.nextFilter', () => {
+		searchUI.cycleToNextFilter();
+	});
+	const previousFilterDisposable = vscode.commands.registerCommand('search-everywhere.previousFilter', () => {
+		searchUI.cycleToPreviousFilter();
 	});
 
 	// Register rebuild index command
@@ -53,12 +59,12 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	// Add commands to context
-	context.subscriptions.push(searchDisposable, rebuildDisposable);
+	context.subscriptions.push(searchDisposable, nextFilterDisposable, previousFilterDisposable, rebuildDisposable);
 
-	console.log('Search Everywhere extension activated');
+	Logger.log('Search Everywhere extension activated');
 }
 
 // This method is called when your extension is deactivated
 export function deactivate() {
-	console.log('Search Everywhere extension deactivated');
+	Logger.log('Search Everywhere extension deactivated');
 }

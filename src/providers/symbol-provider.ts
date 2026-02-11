@@ -2,6 +2,17 @@ import * as vscode from 'vscode';
 import { SearchItemType, SearchProvider, SymbolKindGroup, SymbolSearchItem, mapSymbolKindToGroup } from '../core/types';
 import { Debouncer } from '../utils/debouncer';
 import { ExclusionPatterns } from '../utils/exclusions';
+import { getConfiguration } from '../utils/config';
+import {
+    CACHE_VERSION,
+    getCacheFileUri,
+    getWorkspaceFingerprint,
+    ensureCacheDir,
+    readCache,
+    writeCache
+} from '../cache';
+import type { ManifestEntry, WorkspaceSymbolsCache, SerializedSymbolItem } from '../cache';
+import Logger from '../utils/logging';
 
 /**
  * Provides workspace symbols for searching using VSCode's symbol providers
@@ -10,8 +21,12 @@ export class SymbolSearchProvider implements SearchProvider {
     private symbolItems: SymbolSearchItem[] = [];
     private isRefreshing: boolean = false;
     private refreshDebouncer: Debouncer;
+    private readonly storageUri: vscode.Uri | undefined;
+    /** Single in-flight refresh so concurrent getItems() / refresh() share one run */
+    private loadPromise: Promise<void> | null = null;
 
-    constructor() {
+    constructor(storageUri?: vscode.Uri) {
+        this.storageUri = storageUri;
         // Create a debouncer with 2 second delay to avoid excessive refreshes
         this.refreshDebouncer = new Debouncer(2000);
 
@@ -60,7 +75,7 @@ export class SymbolSearchProvider implements SearchProvider {
      * Schedule a refresh operation, debounced to prevent excessive updates
      */
     private scheduleRefresh(): void {
-        console.log('Scheduling symbol index refresh...');
+        // mstodo console.log('Scheduling symbol index refresh...');
         this.refreshDebouncer.debounce(() => {
             this.refresh();
         });
@@ -69,77 +84,74 @@ export class SymbolSearchProvider implements SearchProvider {
     /**
      * Get all indexed workspace symbol items
      */
-    public async getItems(): Promise<SymbolSearchItem[]> {
-        if (this.symbolItems.length === 0 && !this.isRefreshing) {
-            await this.refresh();
+    public async getItems(_onBatch?: import('../core/types').OnBatchCallback): Promise<SymbolSearchItem[]> {
+        if (this.symbolItems.length === 0) {
+            if (this.loadPromise) {
+                await this.loadPromise;
+            } else {
+                // Assign before awaiting so concurrent getItems() see loadPromise and share this run
+                this.loadPromise = this.runRefreshInternal(false);
+                try {
+                    await this.loadPromise;
+                } finally {
+                    this.loadPromise = null;
+                }
+            }
         }
 
         return this.symbolItems;
     }
 
     /**
-     * Refresh the workspace symbol index
-     * This uses VSCode's built-in workspace symbol provider which indexes ALL symbols
-     * @param force If true, forces refresh even if already refreshing
+     * Refresh the workspace symbol index.
+     * Uses persistent cache when possible; invalidates if any source file mtime changed.
+     * @param force If true, forces refresh even if already refreshing and ignores cache
      */
     public async refresh(force: boolean = false): Promise<void> {
+        if (this.loadPromise !== null) {
+            if (!force) {
+                await this.loadPromise;
+                return;
+            }
+            await this.loadPromise;
+            this.loadPromise = null;
+        }
         if (this.isRefreshing && !force) {
             return;
         }
 
+        this.loadPromise = this.runRefreshInternal(force);
+        try {
+            await this.loadPromise;
+        } finally {
+            this.loadPromise = null;
+        }
+    }
+
+    /**
+     * Single implementation of the refresh work. Caller must assign to loadPromise before awaiting
+     * so concurrent callers share one run.
+     */
+    private async runRefreshInternal(force: boolean): Promise<void> {
         this.isRefreshing = true;
-        console.log('Refreshing workspace symbol index...');
+        Logger.log('Refreshing workspace symbol index...');
         const startTime = performance.now();
 
         this.symbolItems = [];
 
         try {
-            // First, get all basic workspace symbols with an empty query
-            // This typically returns all exported/public symbols
-            const basicSymbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-                'vscode.executeWorkspaceSymbolProvider',
-                ''
-            ) || [];
-
-            // Then try with wildcard queries to ensure we get a comprehensive set
-            // These patterns help find symbols that might not be returned with an empty query
-            const queryPatterns = ['*', 'a*', 'b*', 'c*', 'd*', 'e*', 'f*', 'g*', 'h*', 'i*',
-                                  'j*', 'k*', 'l*', 'm*', 'n*', 'o*', 'p*', 'q*', 'r*', 's*',
-                                  't*', 'u*', 'v*', 'w*', 'x*', 'y*', 'z*', '_*', '$*'];
-
-            // We'll collect all symbols here
-            const allSymbols: vscode.SymbolInformation[] = [...basicSymbols];
-            const symbolIds = new Set(basicSymbols.map(s => this.getSymbolId(s)));
-
-            // Run each query and add unique symbols
-            for (const pattern of queryPatterns) {
-                const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-                    'vscode.executeWorkspaceSymbolProvider',
-                    pattern
-                ) || [];
-
-                // Only add new unique symbols
-                for (const symbol of symbols) {
-                    const id = this.getSymbolId(symbol);
-
-                    if (!symbolIds.has(id)) {
-                        symbolIds.add(id);
-                        allSymbols.push(symbol);
-                    }
+            if (force || !this.storageUri) {
+                await this.fullRefresh();
+            } else {
+                const usedCache = await this.tryLoadFromCache();
+                if (!usedCache) {
+                    await this.fullRefresh();
                 }
             }
 
-            console.log(`Found ${allSymbols.length} total workspace symbols (before filtering)`);
-
-            // Filter out symbols from excluded paths
-            const filteredSymbols = allSymbols.filter(symbol =>
-                !ExclusionPatterns.shouldExclude(symbol.location.uri)
-            );
-
-            console.log(`Filtered to ${filteredSymbols.length} symbols after applying exclusions`);
-
-            // Convert all symbols to SearchItems
-            this.symbolItems = filteredSymbols.map(symbol => this.convertToSearchItem(symbol));
+            if (this.storageUri) {
+                await this.saveCache();
+            }
         } catch (error) {
             console.error('Error refreshing symbol index:', error);
         } finally {
@@ -147,8 +159,190 @@ export class SymbolSearchProvider implements SearchProvider {
 
             const endTime = performance.now();
 
-            console.log(`Indexed ${this.symbolItems.length} symbols in ${endTime - startTime}ms`);
+            Logger.log(`Indexed ${this.symbolItems.length} symbols in ${endTime - startTime}ms`);
         }
+    }
+
+    /**
+     * Build manifest of source file uris + mtimes (same scope as document symbols) for cache invalidation.
+     */
+    private async getSourceFileManifest(): Promise<ManifestEntry[]> {
+        const sourceFilePattern = '**/*.{js,jsx,ts,tsx,py,java,c,cpp,cs,go,rb,php,rust,swift}';
+        const excludePattern = ExclusionPatterns.getExclusionGlob();
+        const { maxDocumentSymbolFiles } = getConfiguration().performance;
+        const manifest: ManifestEntry[] = [];
+
+        for (const folder of vscode.workspace.workspaceFolders!) {
+            let files = await vscode.workspace.findFiles(
+                new vscode.RelativePattern(folder, sourceFilePattern),
+                excludePattern
+            );
+            const batchSize = 500;
+            const entries: { uri: vscode.Uri; mtime: number }[] = [];
+            for (let i = 0; i < files.length; i += batchSize) {
+                const batch = files.slice(i, i + batchSize);
+                const stats = await Promise.all(
+                    batch.map(async (uri) => {
+                        try {
+                            const stat = await vscode.workspace.fs.stat(uri);
+                            return { uri, mtime: stat.mtime };
+                        } catch {
+                            return { uri, mtime: 0 };
+                        }
+                    })
+                );
+                entries.push(...stats);
+            }
+            entries.sort((a, b) => b.mtime - a.mtime);
+            const slice = entries.slice(0, maxDocumentSymbolFiles);
+            for (const { uri, mtime } of slice) {
+                manifest.push({ uri: uri.toString(), mtime });
+            }
+        }
+        return manifest;
+    }
+
+    /**
+     * Try to load from cache. Returns true if cache was valid and used.
+     */
+    private async tryLoadFromCache(): Promise<boolean> {
+        const fileUri = getCacheFileUri(this.storageUri, 'workspace-symbols');
+        if (!fileUri) {
+            return false;
+        }
+
+        const cache = await readCache<WorkspaceSymbolsCache>(fileUri);
+        const fingerprint = getWorkspaceFingerprint();
+        if (!cache || cache.version !== CACHE_VERSION || cache.workspaceFingerprint !== fingerprint) {
+            return false;
+        }
+
+        const currentManifest = await this.getSourceFileManifest();
+        const cachedManifest = cache.manifest || [];
+
+        if (currentManifest.length !== cachedManifest.length) {
+            return false;
+        }
+
+        const cachedMtimeByUri = new Map(cachedManifest.map((e) => [e.uri, e.mtime]));
+        for (const { uri, mtime } of currentManifest) {
+            if (cachedMtimeByUri.get(uri) !== mtime) {
+                return false;
+            }
+        }
+
+        this.symbolItems = (cache.items || []).map((s) => this.deserializeSymbolItem(s));
+        Logger.log(`Workspace symbols: loaded ${this.symbolItems.length} from cache`);
+        return true;
+    }
+
+    private async fullRefresh(): Promise<void> {
+        Logger.log('executeCommand vscode.executeWorkspaceSymbolProvider (pattern=)');
+        const basicSymbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+            'vscode.executeWorkspaceSymbolProvider',
+            ''
+        ) || [];
+
+        const queryPatterns = ['*', 'a*', 'b*', 'c*', 'd*', 'e*', 'f*', 'g*', 'h*', 'i*',
+                              'j*', 'k*', 'l*', 'm*', 'n*', 'o*', 'p*', 'q*', 'r*', 's*',
+                              't*', 'u*', 'v*', 'w*', 'x*', 'y*', 'z*', '_*', '$*'];
+
+        const allSymbols: vscode.SymbolInformation[] = [...basicSymbols];
+        const symbolIds = new Set(basicSymbols.map(s => this.getSymbolId(s)));
+
+        for (const pattern of queryPatterns) {
+            Logger.log(`executeCommand vscode.executeWorkspaceSymbolProvider pattern=${pattern}`);
+            const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+                'vscode.executeWorkspaceSymbolProvider',
+                pattern
+            ) || [];
+
+            for (const symbol of symbols) {
+                const id = this.getSymbolId(symbol);
+                if (!symbolIds.has(id)) {
+                    symbolIds.add(id);
+                    allSymbols.push(symbol);
+                }
+            }
+        }
+
+        Logger.log(`Found ${allSymbols.length} total workspace symbols (before filtering)`);
+
+        const filteredSymbols = allSymbols.filter(symbol =>
+            !ExclusionPatterns.shouldExclude(symbol.location.uri)
+        );
+
+        Logger.log(`Filtered to ${filteredSymbols.length} symbols after applying exclusions`);
+
+        this.symbolItems = filteredSymbols.map(symbol => this.convertToSearchItem(symbol));
+    }
+
+    private async saveCache(): Promise<void> {
+        const fileUri = getCacheFileUri(this.storageUri, 'workspace-symbols');
+        if (!fileUri) {
+            return;
+        }
+
+        await ensureCacheDir(this.storageUri);
+
+        const manifest = await this.getSourceFileManifest();
+        const items: SerializedSymbolItem[] = this.symbolItems.map((item) => this.serializeSymbolItem(item));
+
+        const payload: WorkspaceSymbolsCache = {
+            version: CACHE_VERSION,
+            workspaceFingerprint: getWorkspaceFingerprint(),
+            manifest,
+            items
+        };
+
+        await writeCache(fileUri, payload);
+    }
+
+    private serializeSymbolItem(item: SymbolSearchItem): SerializedSymbolItem {
+        return {
+            id: item.id,
+            label: item.label,
+            description: item.description,
+            detail: item.detail,
+            type: item.type as 'symbol' | 'class',
+            uri: item.uri.toString(),
+            range: {
+                start: { line: item.range.start.line, character: item.range.start.character },
+                end: { line: item.range.end.line, character: item.range.end.character }
+            },
+            symbolKind: item.symbolKind as number,
+            symbolGroup: item.symbolGroup !== undefined ? (item.symbolGroup as number) : undefined,
+            priority: item.priority
+        };
+    }
+
+    private deserializeSymbolItem(s: SerializedSymbolItem): SymbolSearchItem {
+        const uri = vscode.Uri.parse(s.uri);
+        const range = new vscode.Range(
+            s.range.start.line,
+            s.range.start.character,
+            s.range.end.line,
+            s.range.end.character
+        );
+        return {
+            id: s.id,
+            label: s.label,
+            description: s.description,
+            detail: s.detail,
+            type: s.type as SymbolSearchItem['type'],
+            uri,
+            range,
+            symbolKind: s.symbolKind as vscode.SymbolKind,
+            symbolGroup: s.symbolGroup !== undefined ? (s.symbolGroup as SymbolKindGroup) : undefined,
+            priority: s.priority,
+            iconPath: this.getSymbolIcon(s.symbolKind as vscode.SymbolKind),
+            action: async () => {
+                const document = await vscode.workspace.openTextDocument(uri);
+                const editor = await vscode.window.showTextDocument(document);
+                editor.selection = new vscode.Selection(range.start, range.start);
+                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+            }
+        };
     }
 
     /**

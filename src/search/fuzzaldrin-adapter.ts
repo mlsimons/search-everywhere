@@ -1,4 +1,5 @@
-import { FuzzySearcher, SearchItem } from '../core/types';
+import { FuzzySearcher, FuzzySearchOptions, SearchItem } from '../core/types';
+import Logger from '../utils/logging';
 // @ts-ignore - Import with require to avoid TypeScript issues
 const fuzzaldrinPlus = require('fuzzaldrin-plus');
 
@@ -11,9 +12,12 @@ export class FuzzaldrinAdapter implements FuzzySearcher {
     /**
      * Search items using fuzzaldrin-plus
      */
-    public async search(items: SearchItem[], query: string, limit = 100): Promise<SearchItem[]> {
+    public async search(items: SearchItem[], query: string, limit?: number, options?: FuzzySearchOptions): Promise<SearchItem[]> {
+        // When limit is not provided, return all matches (display limit is applied in UI only)
+        const effectiveLimit = limit ?? Number.MAX_SAFE_INTEGER;
+
         if (!query.trim()) {
-            return items.slice(0, limit);
+            return items.slice(0, effectiveLimit);
         }
 
         const startTime = performance.now();
@@ -24,12 +28,14 @@ export class FuzzaldrinAdapter implements FuzzySearcher {
             searchText: `${item.label} ${item.description || ''} ${item.detail || ''}`,
         }));
 
+        const filterOptions: { key: string; maxResults?: number } = { key: 'searchText' };
+        if (effectiveLimit !== Number.MAX_SAFE_INTEGER) {
+            filterOptions.maxResults = effectiveLimit * 2;
+        }
+
         // Perform the search
         // @ts-ignore - Cast to any to avoid TypeScript issues
-        const results = fuzzaldrinPlus.filter(searchableItems, query, {
-            key: 'searchText',
-            maxResults: limit * 2
-        });
+        const results = fuzzaldrinPlus.filter(searchableItems, query, filterOptions);
 
         // Map results back to items and calculate scores
         const foundItems = results.map((result: any) => {
@@ -44,8 +50,8 @@ export class FuzzaldrinAdapter implements FuzzySearcher {
 
         const endTime = performance.now();
 
-        console.log(`Fuzzaldrin search took ${endTime - startTime}ms for ${items.length} items`);
+        Logger.log(`Fuzzaldrin search took ${endTime - startTime}ms for ${items.length} items`);
 
-        return foundItems.slice(0, limit);
+        return foundItems.slice(0, effectiveLimit);
     }
 }

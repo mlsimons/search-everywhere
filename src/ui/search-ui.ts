@@ -2,9 +2,10 @@ import * as vscode from 'vscode';
 import { SearchItem, SearchItemType } from '../core/types';
 import { SearchService } from '../core/search-service';
 import { getConfiguration } from '../utils/config';
+import Logger from '../utils/logging';
 
 /**
- * Filter categories for search results
+ * Filter categories for search results (order used for Tab cycling)
  */
 export enum FilterCategory {
     All = 'all',
@@ -14,6 +15,16 @@ export enum FilterCategory {
     Actions = 'actions',
     Text = 'text'
 }
+
+/** Order of filters when cycling with Tab (all possible categories) */
+const FILTER_ORDER: FilterCategory[] = [
+    FilterCategory.All,
+    FilterCategory.Classes,
+    FilterCategory.Files,
+    FilterCategory.Symbols,
+    FilterCategory.Actions,
+    FilterCategory.Text
+];
 
 /**
  * Manages the VSCode UI for search everywhere
@@ -30,6 +41,12 @@ export class SearchUI {
 
     // Custom buttons for filter categories
     private filterButtons: Map<FilterCategory, vscode.QuickInputButton> = new Map();
+
+    /** Last item the user highlighted; used to preserve selection when items list is replaced (avoids wrong-item bug) */
+    private lastActiveOriginalItem: SearchItem | undefined;
+
+    /** True only after the first result set from show() is displayed; until then we ignore filter input to avoid clearing/race. */
+    private initialLoadComplete = true;
 
     // Prefixes for button tooltips
     private readonly ACTIVE_PREFIX = '● '; // Filled circle for active filter
@@ -63,14 +80,31 @@ export class SearchUI {
 
         // Listen for configuration changes
         vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('searchEverywhere.preview')) {
+            if (e.affectsConfiguration('searchEverywhere')) {
                 this.config = getConfiguration();
             }
         });
     }
 
     /**
-     * Create filter buttons for each category
+     * Return filter categories that are enabled by config (only show buttons for registered providers).
+     */
+    private getEnabledFilterOrder(): FilterCategory[] {
+        return FILTER_ORDER.filter(f => {
+            switch (f) {
+                case FilterCategory.All: return true;
+                case FilterCategory.Classes:
+                case FilterCategory.Symbols: return this.config.indexing.includeSymbols;
+                case FilterCategory.Files: return this.config.indexing.includeFiles;
+                case FilterCategory.Actions: return this.config.indexing.includeCommands;
+                case FilterCategory.Text: return this.config.indexing.includeText;
+                default: return true;
+            }
+        });
+    }
+
+    /**
+     * Create filter buttons for each category (buttons for disabled categories exist but are not shown).
      */
     private createFilterButtons(): void {
         // Define icons for each category
@@ -109,21 +143,17 @@ export class SearchUI {
      * Update the filter buttons in the UI based on the active filter
      */
     private updateFilterButtons(): void {
-        // Create all filter buttons with updated states
+        const enabledOrder = this.getEnabledFilterOrder();
+        // If current filter is disabled (e.g. Actions when commands provider not registered), switch to All
+        if (!enabledOrder.includes(this.activeFilter)) {
+            this.activeFilter = FilterCategory.All;
+        }
+
+        // Create filter buttons only for enabled categories
         const buttons: vscode.QuickInputButton[] = [];
         const filterNames: string[] = []; // Collect names for the placeholder text
 
-        // Add buttons in the desired order
-        const orderedFilters = [
-            FilterCategory.All,
-            FilterCategory.Classes,
-            FilterCategory.Files,
-            FilterCategory.Symbols,
-            FilterCategory.Actions,
-            FilterCategory.Text
-        ];
-
-        for (const filter of orderedFilters) {
+        for (const filter of enabledOrder) {
             // Get the base filter button
             const baseButton = this.filterButtons.get(filter);
 
@@ -140,13 +170,13 @@ export class SearchUI {
 
             // Create a modified button with visual indicator for the active filter
             const button: vscode.QuickInputButton = {
-                // Use dramatically different icons for active vs inactive filters
+                // Active filter: colored icon; inactive: default icon
                 iconPath: isActive
                     ? this.getActiveIcon(filter)
                     : baseButton.iconPath,
-                // Add visual distinguisher to the tooltip text
+                // Tooltip makes selected filter obvious (● Name = active, ○ Name = inactive)
                 tooltip: isActive
-                    ? this.ACTIVE_PREFIX + baseName
+                    ? this.ACTIVE_PREFIX + baseName + ' (selected)'
                     : this.INACTIVE_PREFIX + baseName
             };
 
@@ -167,32 +197,50 @@ export class SearchUI {
     }
 
     /**
-     * Get a visually distinct active icon
+     * Get a visually distinct active icon so the selected filter is easy to see.
+     * Uses a different icon shape (circle-filled) for the active filter so it stands out even when
+     * theme colors are ignored by the quick pick toolbar. The title/placeholder still show which category (e.g. "⟪ Files ⟫").
      */
-    private getActiveIcon(filter: FilterCategory): vscode.ThemeIcon | { light: vscode.Uri; dark: vscode.Uri } {
-        // Use strongly contrasting icons for active state
-        switch (filter) {
-            case FilterCategory.All:
-                return new vscode.ThemeIcon('search', new vscode.ThemeColor('focusBorder'));
+    private getActiveIcon(_filter: FilterCategory): vscode.ThemeIcon {
+        const activeColor = new vscode.ThemeColor('badge.background');
+        return new vscode.ThemeIcon('circle-filled', activeColor);
+    }
 
-            case FilterCategory.Classes:
-                return new vscode.ThemeIcon('symbol-class', new vscode.ThemeColor('focusBorder'));
+    /**
+     * Cycle to the next filter category (e.g. when user presses Tab).
+     * Keybinding is only active when searchEverywhereQuickPickVisible is true.
+     */
+    public cycleToNextFilter(): void {
+        const order = this.getEnabledFilterOrder();
+        const idx = order.indexOf(this.activeFilter);
+        const nextIdx = idx < 0 ? 0 : (idx + 1) % order.length;
+        this.activeFilter = order[nextIdx];
 
-            case FilterCategory.Files:
-                return new vscode.ThemeIcon('files', new vscode.ThemeColor('focusBorder')); // Plural 'files' icon is different
-
-            case FilterCategory.Symbols:
-                return new vscode.ThemeIcon('symbol-field', new vscode.ThemeColor('focusBorder')); // Different symbol icon
-
-            case FilterCategory.Actions:
-                return new vscode.ThemeIcon('play', new vscode.ThemeColor('focusBorder')); // Use 'play' instead of 'run'
-
-            case FilterCategory.Text:
-                return new vscode.ThemeIcon('edit', new vscode.ThemeColor('focusBorder')); // Use 'edit' for text search
-
-            default:
-                return new vscode.ThemeIcon('search', new vscode.ThemeColor('focusBorder'));
+        if (this.searchDebounce) {
+            clearTimeout(this.searchDebounce);
         }
+        this.updateTitle();
+        this.updateFilterButtons();
+        this.performSearch(this.lastQuery);
+    }
+
+    /**
+     * Cycle to the previous filter category.
+     * Keybinding: Alt+Shift+Tab (Shift+Tab does not work in VS Code quick pick - see vscode#180862).
+     * Keybinding is only active when searchEverywhereQuickPickVisible is true.
+     */
+    public cycleToPreviousFilter(): void {
+        const order = this.getEnabledFilterOrder();
+        const idx = order.indexOf(this.activeFilter);
+        const prevIdx = idx <= 0 ? order.length - 1 : idx - 1;
+        this.activeFilter = order[prevIdx];
+
+        if (this.searchDebounce) {
+            clearTimeout(this.searchDebounce);
+        }
+        this.updateTitle();
+        this.updateFilterButtons();
+        this.performSearch(this.lastQuery);
     }
 
     /**
@@ -254,7 +302,13 @@ export class SearchUI {
         // Always reset to "All" filter when opening
         this.activeFilter = FilterCategory.All;
 
-        // Clear any previous search query
+        // Cancel any pending debounced search from a previous session so it can't overwrite our initial results
+        if (this.searchDebounce) {
+            clearTimeout(this.searchDebounce);
+            this.searchDebounce = undefined;
+        }
+
+        // Clear previous query state
         this.quickPick.value = '';
         this.lastQuery = '';
 
@@ -267,17 +321,38 @@ export class SearchUI {
         // Update title
         this.updateTitle();
 
-        // Show the quick pick
-        this.quickPick.show();
+        // Postpone index updates while the pick is open so the list doesn't change and accept goes to the right place
+        this.searchService.setSearchUIActive(true);
 
-        // When opened with no query, show most-used items
-        this.performSearch('');
+        // Ignore filter input until the first result set is displayed (avoids filter text being cleared/races)
+        this.initialLoadComplete = false;
+
+        // Show the quick pick (set context so Tab keybinding is active)
+        this.quickPick.show();
+        void vscode.commands.executeCommand('setContext', 'searchEverywhereQuickPickVisible', true);
+
+        // Defer initial search to next tick: QuickPick may fire onDidChangeValue(previousValue) when it becomes visible.
+        // Do not clear quickPick.value here — if the user already typed, we must not overwrite their text.
+        setTimeout(() => {
+            if (this.searchDebounce) {
+                clearTimeout(this.searchDebounce);
+                this.searchDebounce = undefined;
+            }
+            const currentValue = this.quickPick.value;
+            this.lastQuery = currentValue;
+            this.performSearch(currentValue);
+        }, 0);
     }
 
     /**
      * Handle user typing in the search box
      */
     private onDidChangeValue(value: string): void {
+        // Ignore input until the first result set is displayed (avoids filter cleared / wrong results)
+        if (!this.initialLoadComplete) {
+            return;
+        }
+
         // Clear any scheduled search
         if (this.searchDebounce) {
             clearTimeout(this.searchDebounce);
@@ -309,20 +384,64 @@ export class SearchUI {
             // Perform search
             const results = await this.searchService.search(query);
 
+            // Ignore stale results: if the user changed the query (or filter) while this search was
+            // in flight, do not replace the list. Otherwise we can show wrong results and the
+            // highlighted row can resolve to the wrong item on accept (especially when indexing
+            // is still running and progress is visible).
+            if (query !== this.lastQuery) {
+                return;
+            }
+
             // Apply category filters
             const filteredResults = this.applyCategoryFilter(results);
+            Logger.debug(
+                `applyCategoryFilter: activeFilter=${this.activeFilter} -> ${filteredResults.length} items (${filteredResults.filter(r => r.type === SearchItemType.File).length} files)`
+            );
 
-            // Map to QuickPickItems
-            const items = filteredResults.map(item => this.createQuickPickItem(item));
+            // Map to QuickPickItems (order from search service; QuickPick may re-sort when filtering by typed value)
+            let items = filteredResults.map(item => this.createQuickPickItem(item));
+
+            const maxResults = this.config.performance.maxResults;
+            items  = items.slice(0, maxResults);
 
             // Group items by type
-            this.quickPick.items = this.groupItemsByType(items);
+            // mstodo const groupedItems = this.groupItemsByType(items);
+            this.quickPick.items = items;
+
+            // Preserve selection by item identity when replacing the list. Otherwise VS Code keeps
+            // selection by index, so the highlighted row can become a different item (wrong location on accept).
+            const firstSelectable = items.find(
+                qi => qi.kind !== vscode.QuickPickItemKind.Separator && qi.originalItem
+            );
+            if (this.lastActiveOriginalItem) {
+                const targetId = this.lastActiveOriginalItem.id;
+                const match = items.find(
+                    qi => qi.kind !== vscode.QuickPickItemKind.Separator && qi.originalItem?.id === targetId
+                );
+                if (match) {
+                    this.quickPick.activeItems = [match];
+                } else if (firstSelectable) {
+                    // No match (e.g. item filtered out or not in new results). Do not leave selection
+                    // by index or we may run the wrong item's action on accept.
+                    this.quickPick.activeItems = [firstSelectable];
+                }
+            } else if (firstSelectable) {
+                this.quickPick.activeItems = [firstSelectable];
+            }
 
         } catch (error) {
             console.error('Error performing search:', error);
             this.quickPick.placeholder = 'Error performing search';
         } finally {
             this.quickPick.busy = false;
+            // After first result set is shown, accept filter input and catch up if user typed meanwhile
+            if (!this.initialLoadComplete) {
+                this.initialLoadComplete = true;
+                if (this.quickPick.value !== this.lastQuery) {
+                    this.lastQuery = this.quickPick.value;
+                    void this.performSearch(this.quickPick.value);
+                }
+            }
         }
     }
 
@@ -361,24 +480,34 @@ export class SearchUI {
 
     /**
      * Handle user selecting an item
+     * Use the active (highlighted) item so we never run the wrong item's action when the list
+     * was recently replaced and selectedItems could be stale or index-based.
      */
     private async onDidAccept(): Promise<void> {
-        const selectedItems = this.quickPick.selectedItems;
+        const toUse = this.quickPick.activeItems.length > 0
+            ? this.quickPick.activeItems[0]
+            : this.quickPick.selectedItems[0];
 
-        if (selectedItems.length > 0) {
-            const selectedItem = selectedItems[0];
-
+        if (toUse) {
             // Close the quick pick
             this.quickPick.hide();
 
             // Execute the action
             try {
-                if (selectedItem.originalItem) {
-                    await selectedItem.originalItem.action();
+                if (toUse.originalItem) {
+                    this.searchService.recordItemUsed(toUse.originalItem);
+                    await toUse.originalItem.action();
                 }
             } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
                 console.error('Error executing action:', error);
-                vscode.window.showErrorMessage(`Error executing action: ${error}`);
+                if (this.isFileOpenBlockedError(message)) {
+                    vscode.window.showErrorMessage(
+                        "This file can't be opened in the editor (it may be too large or from a cached index). Try opening it from the file explorer or pick a different result."
+                    );
+                } else {
+                    vscode.window.showErrorMessage(`Could not open: ${message}`);
+                }
             }
         }
     }
@@ -387,12 +516,21 @@ export class SearchUI {
      * Handle user closing the dialog
      */
     private onDidHide(): void {
+        this.searchService.setSearchUIActive(false);
+        Logger.log('executeCommand setContext searchEverywhereQuickPickVisible=false');
+        void vscode.commands.executeCommand('setContext', 'searchEverywhereQuickPickVisible', false);
+
+        this.lastActiveOriginalItem = undefined;
+        this.lastQuery = '';
+        this.initialLoadComplete = true; // Reset so next show() starts with input disabled until ready
+
         // Clear any scheduled search
         if (this.searchDebounce) {
             clearTimeout(this.searchDebounce);
         }
 
-        // Clear quick pick items to free memory
+        // Clear quick pick value and items so reopening shows recent items, not previous search
+        this.quickPick.value = '';
         this.quickPick.items = [];
 
         // Dispose of any preview disposables
@@ -410,9 +548,17 @@ export class SearchUI {
     }
 
     /**
-     * Handle selection changes for previewing
+     * Handle selection changes for previewing and active-row indicator
      */
     private onDidChangeActive(items: readonly SearchQuickPickItem[]): void {
+        // Always track last active item so we can preserve selection when the list is replaced
+        if (items.length > 0) {
+            const selectedItem = items[0];
+            if (selectedItem.kind !== vscode.QuickPickItemKind.Separator && selectedItem.originalItem) {
+                this.lastActiveOriginalItem = selectedItem.originalItem;
+            }
+        }
+
         // Skip if preview is disabled or no items are selected
         if (!this.config.preview.enabled || items.length === 0) {
             return;
@@ -475,8 +621,26 @@ export class SearchUI {
                 this.previewDisposables.push(decorationType);
             }
         } catch (error) {
-            console.error('Error previewing item:', error);
+            const message = error instanceof Error ? error.message : String(error);
+            if (!this.isFileOpenBlockedError(message)) {
+                console.error('Error previewing item:', error);
+            }
         }
+    }
+
+    /**
+     * Returns true if the error is due to the file not being openable in the editor
+     * (e.g. over 50MB sync limit, or stale/cached path). Used to show a friendly message instead of raw API errors.
+     */
+    private isFileOpenBlockedError(message: string): boolean {
+        const s = message.toLowerCase();
+        return (
+            s.includes('50mb') ||
+            s.includes('cannot be synchronized') ||
+            s.includes('synchronized with extensions') ||
+            s.includes('cannot open file') ||
+            s.includes('codeexpectederror')
+        );
     }
 
     /**
