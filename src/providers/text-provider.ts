@@ -85,7 +85,7 @@ export class TextSearchProvider implements SearchProvider {
             };
 
             // Perform the search
-            Logger.debug(`Starting text search for: ${query}`);
+            //Logger.debug(`Starting text search for: ${query}`);
             const startTime = performance.now();
 
             // Use VS Code's search API
@@ -168,7 +168,7 @@ export class TextSearchProvider implements SearchProvider {
                 }
             }
         } catch (error) {
-            Logger.debug(`Error searching in file ${uri.toString()}: ${error}`);
+            // Logger.debug(`Error searching in file ${uri.toString()}: ${error}`);
         }
     }
 

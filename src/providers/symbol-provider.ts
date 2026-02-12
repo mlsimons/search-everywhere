@@ -72,12 +72,14 @@ export class SymbolSearchProvider implements SearchProvider {
     }
 
     /**
-     * Schedule a refresh operation, debounced to prevent excessive updates
+     * Schedule a refresh operation, debounced to prevent excessive updates.
+     * Uses force so we always run a full refresh and pick up new symbols even if a previous
+     * refresh was in progress; otherwise incremental index updates would never see new workspace symbols.
      */
     private scheduleRefresh(): void {
         // mstodo console.log('Scheduling symbol index refresh...');
         this.refreshDebouncer.debounce(() => {
-            this.refresh();
+            this.refresh(true);
         });
     }
 
@@ -134,7 +136,7 @@ export class SymbolSearchProvider implements SearchProvider {
      */
     private async runRefreshInternal(force: boolean): Promise<void> {
         this.isRefreshing = true;
-        Logger.log('Refreshing workspace symbol index...');
+        //Logger.log('Refreshing workspace symbol index...');
         const startTime = performance.now();
 
         this.symbolItems = [];
@@ -159,7 +161,7 @@ export class SymbolSearchProvider implements SearchProvider {
 
             const endTime = performance.now();
 
-            Logger.log(`Indexed ${this.symbolItems.length} symbols in ${endTime - startTime}ms`);
+            //Logger.log(`Indexed ${this.symbolItems.length} symbols in ${endTime - startTime}ms`);
         }
     }
 
@@ -232,12 +234,12 @@ export class SymbolSearchProvider implements SearchProvider {
         }
 
         this.symbolItems = (cache.items || []).map((s) => this.deserializeSymbolItem(s));
-        Logger.log(`Workspace symbols: loaded ${this.symbolItems.length} from cache`);
+        //Logger.log(`Workspace symbols: loaded ${this.symbolItems.length} from cache`);
         return true;
     }
 
     private async fullRefresh(): Promise<void> {
-        Logger.log('executeCommand vscode.executeWorkspaceSymbolProvider (pattern=)');
+        //Logger.log('executeCommand vscode.executeWorkspaceSymbolProvider (pattern=)');
         const basicSymbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
             'vscode.executeWorkspaceSymbolProvider',
             ''
@@ -251,7 +253,7 @@ export class SymbolSearchProvider implements SearchProvider {
         const symbolIds = new Set(basicSymbols.map(s => this.getSymbolId(s)));
 
         for (const pattern of queryPatterns) {
-            Logger.log(`executeCommand vscode.executeWorkspaceSymbolProvider pattern=${pattern}`);
+            //Logger.log(`executeCommand vscode.executeWorkspaceSymbolProvider pattern=${pattern}`);
             const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
                 'vscode.executeWorkspaceSymbolProvider',
                 pattern
@@ -266,13 +268,13 @@ export class SymbolSearchProvider implements SearchProvider {
             }
         }
 
-        Logger.log(`Found ${allSymbols.length} total workspace symbols (before filtering)`);
+        //Logger.log(`Found ${allSymbols.length} total workspace symbols (before filtering)`);
 
         const filteredSymbols = allSymbols.filter(symbol =>
             !ExclusionPatterns.shouldExclude(symbol.location.uri)
         );
 
-        Logger.log(`Filtered to ${filteredSymbols.length} symbols after applying exclusions`);
+        //Logger.log(`Filtered to ${filteredSymbols.length} symbols after applying exclusions`);
 
         this.symbolItems = filteredSymbols.map(symbol => this.convertToSearchItem(symbol));
     }

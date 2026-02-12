@@ -45,6 +45,9 @@ export class SearchUI {
     /** Last item the user highlighted; used to preserve selection when items list is replaced (avoids wrong-item bug) */
     private lastActiveOriginalItem: SearchItem | undefined;
 
+    /** Last unfiltered search results; used to re-apply category filter instantly when switching filters without re-running search. */
+    private lastRawResults: SearchItem[] = [];
+
     /** True only after the first result set from show() is displayed; until then we ignore filter input to avoid clearing/race. */
     private initialLoadComplete = true;
 
@@ -221,7 +224,7 @@ export class SearchUI {
         }
         this.updateTitle();
         this.updateFilterButtons();
-        this.performSearch(this.lastQuery);
+        this.applyFilterOnly();
     }
 
     /**
@@ -240,7 +243,7 @@ export class SearchUI {
         }
         this.updateTitle();
         this.updateFilterButtons();
-        this.performSearch(this.lastQuery);
+        this.applyFilterOnly();
     }
 
     /**
@@ -274,8 +277,8 @@ export class SearchUI {
                 // Update buttons to highlight the active one
                 this.updateFilterButtons();
 
-                // Perform search with current query
-                this.performSearch(this.lastQuery);
+                // Re-apply filter to cached results (instant; no search service call)
+                this.applyFilterOnly();
                 break;
             }
         }
@@ -311,6 +314,7 @@ export class SearchUI {
         // Clear previous query state
         this.quickPick.value = '';
         this.lastQuery = '';
+        this.lastRawResults = [];
 
         // Refresh configuration
         this.config = getConfiguration();
@@ -392,17 +396,12 @@ export class SearchUI {
                 return;
             }
 
-            // Apply category filters
-            const filteredResults = this.applyCategoryFilter(results);
-            Logger.debug(
-                `applyCategoryFilter: activeFilter=${this.activeFilter} -> ${filteredResults.length} items (${filteredResults.filter(r => r.type === SearchItemType.File).length} files)`
-            );
+            this.lastRawResults = results;
 
-            // Map to QuickPickItems (order from search service; QuickPick may re-sort when filtering by typed value)
-            let items = filteredResults.map(item => this.createQuickPickItem(item));
-
+            // Apply category filter and limit to maxResults
             const maxResults = this.config.performance.maxResults;
-            items  = items.slice(0, maxResults);
+            const filteredResults = this.applyCategoryFilter(results, maxResults);
+            const items = filteredResults.map(item => this.createQuickPickItem(item));
 
             // Group items by type
             // mstodo const groupedItems = this.groupItemsByType(items);
@@ -446,36 +445,65 @@ export class SearchUI {
     }
 
     /**
-     * Apply the active category filter to search results
+     * Apply the active category filter to search results and limit to maxResults.
      */
-    private applyCategoryFilter(items: SearchItem[]): SearchItem[] {
-        // If "All" is selected, return all items
+    private applyCategoryFilter(items: SearchItem[], maxResults: number): SearchItem[] {
+        let filtered: SearchItem[];
         if (this.activeFilter === FilterCategory.All) {
-            return items;
+            filtered = items;
+        } else {
+            filtered = items.filter(item => {
+                switch (this.activeFilter) {
+                    case FilterCategory.Classes:
+                        return item.type === SearchItemType.Class;
+
+                    case FilterCategory.Files:
+                        return item.type === SearchItemType.File;
+
+                    case FilterCategory.Symbols:
+                        return item.type === SearchItemType.Symbol;
+
+                    case FilterCategory.Actions:
+                        return item.type === SearchItemType.Command;
+
+                    case FilterCategory.Text:
+                        return item.type === SearchItemType.TextMatch;
+
+                    default:
+                        return true;
+                }
+            });
         }
+        return filtered.slice(0, maxResults);
+    }
 
-        // Otherwise, filter based on the selected category
-        return items.filter(item => {
-            switch (this.activeFilter) {
-                case FilterCategory.Classes:
-                    return item.type === SearchItemType.Class;
+    /**
+     * Re-apply the current category filter to cached results and update the list.
+     * Used when switching filters so we don't re-run the search service (instant response).
+     */
+    private applyFilterOnly(): void {
+        const maxResults = this.config.performance.maxResults;
+        const filteredResults = this.applyCategoryFilter(this.lastRawResults, maxResults);
+        const items = filteredResults.map(item => this.createQuickPickItem(item));
 
-                case FilterCategory.Files:
-                    return item.type === SearchItemType.File;
+        this.quickPick.items = items;
 
-                case FilterCategory.Symbols:
-                    return item.type === SearchItemType.Symbol;
-
-                case FilterCategory.Actions:
-                    return item.type === SearchItemType.Command;
-
-                case FilterCategory.Text:
-                    return item.type === SearchItemType.TextMatch;
-
-                default:
-                    return true;
+        const firstSelectable = items.find(
+            qi => qi.kind !== vscode.QuickPickItemKind.Separator && qi.originalItem
+        );
+        if (this.lastActiveOriginalItem) {
+            const targetId = this.lastActiveOriginalItem.id;
+            const match = items.find(
+                qi => qi.kind !== vscode.QuickPickItemKind.Separator && qi.originalItem?.id === targetId
+            );
+            if (match) {
+                this.quickPick.activeItems = [match];
+            } else if (firstSelectable) {
+                this.quickPick.activeItems = [firstSelectable];
             }
-        });
+        } else if (firstSelectable) {
+            this.quickPick.activeItems = [firstSelectable];
+        }
     }
 
     /**

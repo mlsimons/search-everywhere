@@ -5,10 +5,34 @@ import { SearchService } from './core/search-service';
 import { SearchUI } from './ui/search-ui';
 import Logger from './utils/logging';
 
+/**
+ * Log unhandled errors so crashes show up in Output > Search Everywhere and Debug Console.
+ * Remove or guard with a "debug" config flag if you don't want this in production.
+ */
+function installCrashTracer(): void {
+	const format = (err: unknown): string => {
+		if (err instanceof Error) {
+			return `${err.message}\n${err.stack ?? ''}`;
+		}
+		return String(err);
+	};
+	process.on('uncaughtException', (err) => {
+		const msg = `[CRASH] uncaughtException: ${format(err)}`;
+		Logger.log(msg);
+		console.error('[Search Everywhere]', msg);
+	});
+	process.on('unhandledRejection', (reason, promise) => {
+		const msg = `[CRASH] unhandledRejection: ${format(reason)}`;
+		Logger.log(msg);
+		console.error('[Search Everywhere]', msg);
+	});
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
 	Logger.initialize();
+	installCrashTracer();
 	Logger.debug('Search Everywhere extension activated');
 
 	// Create the search service

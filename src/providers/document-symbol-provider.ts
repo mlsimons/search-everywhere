@@ -78,7 +78,7 @@ export class DocumentSymbolProvider implements SearchProvider {
             );
 
             // Get document symbols for the file
-            Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
+            // Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
             const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                 'vscode.executeDocumentSymbolProvider',
                 uri
@@ -300,7 +300,7 @@ export class DocumentSymbolProvider implements SearchProvider {
                         continue;
                     }
                     try {
-                        Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
+                        //Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
                         const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                             'vscode.executeDocumentSymbolProvider',
                             uri
@@ -526,7 +526,7 @@ export class DocumentSymbolProvider implements SearchProvider {
                 }
 
                 // Get document symbols using VSCode's document symbol provider
-                Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
+                //Logger.log(`executeCommand vscode.executeDocumentSymbolProvider uri=${uri.toString()}`);
                 const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
                     'vscode.executeDocumentSymbolProvider',
                     uri

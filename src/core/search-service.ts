@@ -341,8 +341,9 @@ export class SearchService {
                     try {
                         if (force) {
                             Logger.log(`Forcing refresh of ${name} provider...`);
-                            await provider.refresh(true);
                         }
+                        // Always run refresh so providers load from cache or do a full index when there is no cache
+                        await provider.refresh(force);
 
                         const items = await provider.getItems(mergeBatch);
 
@@ -547,10 +548,11 @@ export class SearchService {
         });
 
         // Debug: log top 5 result labels when we have activityScore in the set (to verify order)
-        const withActivity = results.filter(r => typeof r.activityScore === 'number');
+        // quick pick re-orders, so we put it in right order and quick pick will fuck it up.
+        /* const withActivity = results.filter(r => typeof r.activityScore === 'number');
         if (withActivity.length > 0) {
             Logger.debug(`sortResultsByPriority: top 5 = ${results.slice(0, 5).map(r => r.label).join(' | ')}`);
-        }
+        } */
     }
 
     /**
